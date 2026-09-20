@@ -17,6 +17,7 @@ import json
 import hashlib
 import logging
 import traceback
+import types
 from collections import deque
 from pathlib import Path
 
@@ -28,6 +29,7 @@ ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
 EARLY_LOG_STREAM = None
 EARLY_LOG_PATH = None
+DYNAMIC_PLUGIN_PACKAGE = "sugoihook_dynamic_plugins"
 
 
 def is_valid_plugins_config(config):
@@ -294,6 +296,7 @@ class SugoiHookGUI:
         self.plugins_folder = None
         self.bundled_plugins_folder = None
         self.plugin_file_paths = {}
+        self.plugin_module_names = {}
         self.plugin_settings = {}
         self.config_warnings = []
         
@@ -547,7 +550,11 @@ class SugoiHookGUI:
                         plugin.enabled = True
                         plugin.on_enable()
                 except Exception:
-                    pass
+                    logging.exception('Failed to discover plugin: %s', plugin_file)
+
+        for filename in list(self.plugins):
+            if filename not in current_files:
+                self.unload_plugin(filename)
         
         # Clean up active_plugins list - remove any that weren't found
         self.active_plugins = [p for p in self.active_plugins if p in self.plugins]
@@ -942,14 +949,16 @@ class SugoiHookGUI:
         """Load a single plugin from a file path"""
         if not PLUGINS_AVAILABLE:
             return None
-        
-        plugin_name = plugin_path.stem
-        
+        plugin_path = Path(plugin_path)
+        module_name = self.get_plugin_module_name(plugin_path)
         try:
-            # Load the module dynamically
-            spec = importlib.util.spec_from_file_location(plugin_name, plugin_path)
+            self.unload_plugin(plugin_path.name)
+            self.ensure_dynamic_plugin_package()
+            spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f'Could not create an import specification for {plugin_path}')
             module = importlib.util.module_from_spec(spec)
-            sys.modules[plugin_name] = module
+            sys.modules[module_name] = module
             spec.loader.exec_module(module)
             
             # Look for a 'plugin' instance or a class that inherits from HookPlugin
@@ -967,20 +976,51 @@ class SugoiHookGUI:
                         plugin_instance = attr()
                         break
             
-            if plugin_instance:
-                try:
-                    plugin_instance.app = self
-                except Exception:
-                    pass
+            if plugin_instance is not None:
+                if not isinstance(plugin_instance, HookPlugin):
+                    raise TypeError(f"module.plugin must be a HookPlugin, got {type(plugin_instance).__name__}")
+                plugin_instance.app = self
                 self.plugins[plugin_path.name] = plugin_instance
                 self.plugin_file_paths[plugin_path.name] = plugin_path
+                self.plugin_module_names[plugin_path.name] = module_name
                 return plugin_instance
-                
+            raise TypeError("plugin module did not provide a HookPlugin instance")
         except Exception:
+            sys.modules.pop(module_name, None)
             logging.exception('Failed to load plugin from %s', plugin_path)
-            pass
-        
         return None
+
+    def ensure_dynamic_plugin_package(self):
+        """Create the private namespace that owns dynamically loaded plugins."""
+        package = sys.modules.get(DYNAMIC_PLUGIN_PACKAGE)
+        if package is None:
+            package = types.ModuleType(DYNAMIC_PLUGIN_PACKAGE)
+            package.__path__ = []
+            sys.modules[DYNAMIC_PLUGIN_PACKAGE] = package
+
+    def get_plugin_module_name(self, plugin_path):
+        resolved_path = str(Path(plugin_path).resolve()).casefold()
+        safe_stem = re.sub(r'\W+', '_', Path(plugin_path).stem).strip('_') or 'plugin'
+        path_hash = hashlib.sha256(resolved_path.encode('utf-8')).hexdigest()[:16]
+        return f"{DYNAMIC_PLUGIN_PACKAGE}.{safe_stem}_{path_hash}"
+
+    def unload_plugin(self, plugin_filename):
+        """Disable one plugin and remove only its tracked dynamic module."""
+        plugin = self.plugins.get(plugin_filename)
+        if plugin is not None:
+            try:
+                plugin.enabled = False
+            except Exception:
+                pass
+            try:
+                plugin.on_disable()
+            except Exception:
+                logging.exception('Failed to disable plugin during unload: %s', plugin_filename)
+        self.plugins.pop(plugin_filename, None)
+        self.plugin_file_paths.pop(plugin_filename, None)
+        module_name = self.plugin_module_names.pop(plugin_filename, None)
+        if module_name:
+            sys.modules.pop(module_name, None)
     
     
     def activate_plugin(self, plugin_filename):
@@ -1045,26 +1085,9 @@ class SugoiHookGUI:
         plugin_filenames = list(self.plugins.keys())
 
         for plugin_filename in plugin_filenames:
-            plugin = self.plugins.get(plugin_filename)
-            if plugin is None:
-                continue
-            try:
-                plugin.enabled = False
-            except Exception:
-                pass
-            try:
-                plugin.on_disable()
-            except Exception:
-                logging.exception('Failed to disable plugin during shutdown: %s', plugin_filename)
+            self.unload_plugin(plugin_filename)
 
         self.active_plugins = []
-
-        for plugin_filename in plugin_filenames:
-            module_name = Path(plugin_filename).stem
-            try:
-                sys.modules.pop(module_name, None)
-            except Exception:
-                pass
 
     
     def run_pre_translation_plugins(self, text):
@@ -1465,6 +1488,11 @@ class SugoiHookGUI:
                 import shutil
                 shutil.copy2(source_path, dest_path)
                 
+                # A replacement keeps the same filename; remove its active
+                # marker so the new instance is enabled below.
+                if dest_path.name in self.active_plugins:
+                    self.deactivate_plugin(dest_path.name)
+
                 # Load the new plugin
                 plugin = self.load_plugin(dest_path)
                 
@@ -1522,12 +1550,10 @@ class SugoiHookGUI:
                         )
                         return
 
-                    # Deactivate first
-                    self.deactivate_plugin(plugin_filename)
-                    
-                    # Remove from plugins dict
-                    del self.plugins[plugin_filename]
-                    self.plugin_file_paths.pop(plugin_filename, None)
+                    # Disable and unload the exact dynamic module before deleting the file.
+                    if plugin_filename in self.active_plugins:
+                        self.active_plugins.remove(plugin_filename)
+                    self.unload_plugin(plugin_filename)
                     
                     # Remove from plugin_order
                     if plugin_filename in self.plugin_order:
