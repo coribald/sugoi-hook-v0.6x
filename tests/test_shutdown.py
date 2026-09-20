@@ -1,9 +1,9 @@
-from collections import deque
 import threading
 import unittest
 from unittest.mock import patch
 
 import SugoiHook_gui as gui
+from ui_dispatcher import UIThreadDispatcher
 
 
 class FailingPipeline:
@@ -30,16 +30,15 @@ class ShutdownTests(unittest.TestCase):
         app.output_processing_lock = threading.RLock()
         app.shutdown_plugin_instances = lambda: (_ for _ in ()).throw(RuntimeError("plugin shutdown failed"))
         app.tray_icon = None
-        app.ui_callback_lock = threading.Lock()
-        app.ui_callback_shutdown = False
-        app.ui_callback_queue = deque([("callback", ())])
         app.root = RecordingRoot()
+        app.ui_dispatcher = UIThreadDispatcher(app.root)
+        app.ui_dispatcher.dispatch(lambda: None)
 
         with patch.object(gui, "TRAY_AVAILABLE", False), self.assertLogs(level="ERROR") as logs:
             app.finish_quit_app()
 
-        self.assertTrue(app.ui_callback_shutdown)
-        self.assertEqual(list(app.ui_callback_queue), [])
+        self.assertTrue(app.ui_dispatcher._stopped)
+        self.assertEqual(list(app.ui_dispatcher._callbacks), [])
         self.assertEqual(app.root.calls, ["quit", "destroy"])
         self.assertTrue(any("Failed to stop output pipeline" in message for message in logs.output))
         self.assertTrue(any("Failed to shut down plugins" in message for message in logs.output))

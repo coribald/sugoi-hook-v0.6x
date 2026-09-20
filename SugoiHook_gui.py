@@ -19,13 +19,13 @@ import logging
 import traceback
 import types
 import copy
-from collections import deque
 from pathlib import Path
 
 from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_session import LunaProcessSession
 from output_pipeline import OutputPipeline
 from runtime_context import resolve_runtime_context
+from ui_dispatcher import UIThreadDispatcher
 
 ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
@@ -317,10 +317,8 @@ class SugoiHookGUI:
         self.window_geometry_after_id = None
         self.pipeline_debug_enabled = runtime_debug_logging_enabled()
         self.output_processing_lock = threading.RLock()
-        self.ui_callback_lock = threading.Lock()
-        self.ui_callback_queue = deque()
-        self.ui_callback_shutdown = False
-        self.root.after(10, self.drain_ui_callbacks)
+        self.ui_dispatcher = UIThreadDispatcher(self.root)
+        self.ui_dispatcher.start()
         self.output_pipeline = OutputPipeline(
             prepare=self.prepare_plugin_output_bundle,
             complete=self.complete_plugin_output_bundle,
@@ -454,27 +452,11 @@ class SugoiHookGUI:
 
     def run_on_ui_thread(self, callback, *args):
         """Run a callback on the Tk UI thread."""
-        if threading.current_thread() is threading.main_thread():
-            callback(*args)
-            return
-        with self.ui_callback_lock:
-            if not self.ui_callback_shutdown:
-                self.ui_callback_queue.append((callback, args))
+        self.ui_dispatcher.dispatch(callback, *args)
 
     def drain_ui_callbacks(self):
-        """Run callbacks queued by background workers without calling Tk off-thread."""
-        callbacks = []
-        with self.ui_callback_lock:
-            while self.ui_callback_queue:
-                callbacks.append(self.ui_callback_queue.popleft())
-            shutdown = self.ui_callback_shutdown
-        for callback, args in callbacks:
-            try:
-                callback(*args)
-            except Exception:
-                logging.exception("UI callback failed")
-        if not shutdown:
-            self.root.after(10, self.drain_ui_callbacks)
+        """Compatibility delegate for callers that manually drain the queue."""
+        self.ui_dispatcher.drain()
 
     # ==================== PLUGIN SYSTEM METHODS =============    
     def init_plugin_system(self):
@@ -4978,11 +4960,9 @@ For more information, refer to the Luna Hook documentation and current community
             except Exception:
                 logging.exception('Failed to stop system tray icon')
         try:
-            with self.ui_callback_lock:
-                self.ui_callback_shutdown = True
-                self.ui_callback_queue.clear()
+            self.ui_dispatcher.stop()
         except Exception:
-            logging.exception('Failed to clear UI callback queue')
+            logging.exception('Failed to stop UI dispatcher')
         try:
             self.root.quit()
         except Exception:

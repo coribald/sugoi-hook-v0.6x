@@ -5,7 +5,6 @@ runtime decisions and cross-thread behavior explicit before those concerns
 move into dedicated modules.
 """
 
-from collections import deque
 from hashlib import md5
 from io import StringIO
 from pathlib import Path
@@ -18,6 +17,7 @@ from unittest.mock import patch
 import SugoiHook_gui as gui
 from luna_session import LunaProcessSession
 from runtime_context import resolve_runtime_context
+from ui_dispatcher import UIThreadDispatcher
 
 
 gui.sys.stdout = gui.ORIGINAL_STDOUT
@@ -112,10 +112,8 @@ class RuntimePathCharacterizationTests(unittest.TestCase):
 class UIQueueCharacterizationTests(unittest.TestCase):
     def make_app(self):
         app = gui.SugoiHookGUI.__new__(gui.SugoiHookGUI)
-        app.ui_callback_lock = threading.Lock()
-        app.ui_callback_queue = deque()
-        app.ui_callback_shutdown = False
         app.root = RecordingRoot()
+        app.ui_dispatcher = UIThreadDispatcher(app.root)
         return app
 
     def test_background_callbacks_are_fifo_and_callback_failures_do_not_stop_later_work(self):
@@ -135,7 +133,7 @@ class UIQueueCharacterizationTests(unittest.TestCase):
             app.drain_ui_callbacks()
 
         self.assertEqual(delivered, ["first", "last"])
-        self.assertEqual(list(app.ui_callback_queue), [])
+        self.assertEqual(list(app.ui_dispatcher._callbacks), [])
         self.assertEqual([delay for delay, _ in app.root.after_calls], [10])
         self.assertTrue(any("UI callback failed" in message for message in logs.output))
 
@@ -144,15 +142,38 @@ class UIQueueCharacterizationTests(unittest.TestCase):
         delivered = []
         app.run_on_ui_thread(delivered.append, "immediate")
 
-        with app.ui_callback_lock:
-            app.ui_callback_shutdown = True
+        app.ui_dispatcher.stop()
 
         worker = threading.Thread(target=app.run_on_ui_thread, args=(delivered.append, "rejected"))
         worker.start()
         worker.join()
 
         self.assertEqual(delivered, ["immediate"])
-        self.assertEqual(list(app.ui_callback_queue), [])
+        self.assertEqual(list(app.ui_dispatcher._callbacks), [])
+
+
+class UIThreadDispatcherCharacterizationTests(unittest.TestCase):
+    def test_start_schedules_a_drain_and_stop_prevents_future_scheduling(self):
+        root = RecordingRoot()
+        dispatcher = UIThreadDispatcher(root)
+
+        dispatcher.start()
+        dispatcher.stop()
+        dispatcher.drain()
+
+        self.assertEqual([delay for delay, _ in root.after_calls], [10])
+
+    def test_stop_during_a_drain_prevents_the_next_poll(self):
+        root = RecordingRoot()
+        dispatcher = UIThreadDispatcher(root)
+        dispatcher.start()
+
+        worker = threading.Thread(target=dispatcher.dispatch, args=(dispatcher.stop,))
+        worker.start()
+        worker.join()
+        dispatcher.drain()
+
+        self.assertEqual([delay for delay, _ in root.after_calls], [10])
 
 
 class ProcessAndProfileCharacterizationTests(unittest.TestCase):
