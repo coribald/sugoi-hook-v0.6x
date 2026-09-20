@@ -6,9 +6,21 @@ echo.
 
 set "PIP_CACHE_DIR=%CD%\.pip-cache"
 set "NUITKA_CACHE_DIR=%CD%\.nuitka-cache"
+set "BUILD_VENV=%CD%\.build-venv"
+set "BUILD_PYTHON=%BUILD_VENV%\Scripts\python.exe"
 set "OUTPUT_DIR=SugoiHook_debug_builds"
 set "DIST_DIR=%OUTPUT_DIR%\SugoiHook_gui.dist"
 set "PRESERVE_DIR=.build-preserve\debug"
+
+if not exist "%BUILD_PYTHON%" (
+    echo Creating isolated build environment...
+    python -m venv "%BUILD_VENV%"
+    if errorlevel 1 (
+        echo Failed to create isolated build environment.
+        if /I not "%NO_PAUSE%"=="1" pause
+        exit /b 1
+    )
+)
 
 echo Preserving runtime *_config.json files from %DIST_DIR%...
 if exist "%PRESERVE_DIR%" rmdir /s /q "%PRESERVE_DIR%"
@@ -19,7 +31,7 @@ echo Cleaning previous debug build artifacts...
 if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
 
 echo Installing pinned runtime and build dependencies...
-python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-build.txt
+"%BUILD_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt -r requirements-build.txt
 if errorlevel 1 (
     echo Failed to install pinned dependencies.
     if /I not "%NO_PAUSE%"=="1" pause
@@ -30,7 +42,7 @@ echo.
 echo Starting standalone debug build...
 echo.
 
-python -m nuitka ^
+"%BUILD_PYTHON%" -m nuitka ^
     --mode=standalone ^
     --include-raw-dir=luna_builds=luna_builds ^
     --include-raw-dir=dictionaries=dictionaries ^

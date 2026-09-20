@@ -13,6 +13,7 @@ venv/
 env/
 ENV/
 Python39/
+.build-venv/
 
 # IDE
 .vscode/

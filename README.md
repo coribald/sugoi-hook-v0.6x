@@ -124,9 +124,11 @@ Debug standalone build:
 build_debug_standalone.bat
 ```
 
-Both scripts install the pinned runtime and build dependencies from
-`requirements.txt` and `requirements-build.txt`. To run either script without
-waiting at its final prompt (for automation), use:
+Both scripts create and reuse an isolated `.build-venv` and install the pinned
+runtime and build dependencies from `requirements.txt` and
+`requirements-build.txt` into it. They do not modify the Python environment
+used to invoke the script. To run either script without waiting at its final
+prompt (for automation), use:
 
 ```powershell
 $env:NO_PAUSE = "1"; .\build.bat
@@ -134,6 +136,7 @@ $env:NO_PAUSE = "1"; .\build.bat
 
 Current build behavior:
 
+- isolates build dependencies in the repo-local `.build-venv`
 - uses repo-local pip and Nuitka caches
 - uses Nuitka 4.0.7 and zstandard 0.25.0 from `requirements-build.txt`
 - includes the runtime asset folders used by the app:

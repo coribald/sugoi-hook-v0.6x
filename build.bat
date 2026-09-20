@@ -6,8 +6,20 @@ echo.
 
 set "PIP_CACHE_DIR=%CD%\.pip-cache"
 set "NUITKA_CACHE_DIR=%CD%\.nuitka-cache"
+set "BUILD_VENV=%CD%\.build-venv"
+set "BUILD_PYTHON=%BUILD_VENV%\Scripts\python.exe"
 set "OUTPUT_DIR=SugoiHook_builds"
 set "PRESERVE_DIR=.build-preserve\release"
+
+if not exist "%BUILD_PYTHON%" (
+    echo Creating isolated build environment...
+    python -m venv "%BUILD_VENV%"
+    if errorlevel 1 (
+        echo Failed to create isolated build environment.
+        if /I not "%NO_PAUSE%"=="1" pause
+        exit /b 1
+    )
+)
 
 echo Preserving runtime *_config.json files from %OUTPUT_DIR%...
 if exist "%PRESERVE_DIR%" rmdir /s /q "%PRESERVE_DIR%"
@@ -18,7 +30,7 @@ echo Cleaning previous release build artifacts...
 if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
 
 echo Installing pinned runtime and build dependencies...
-python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-build.txt
+"%BUILD_PYTHON%" -m pip install --disable-pip-version-check -r requirements.txt -r requirements-build.txt
 if errorlevel 1 (
     echo Failed to install pinned dependencies.
     if /I not "%NO_PAUSE%"=="1" pause
@@ -34,7 +46,7 @@ echo.
 REM Build with Nuitka - Single file mode with raw runtime assets included
 REM Avoid forced stdout/stderr redirection here; in onefile mode it causes
 REM an early native APPCRASH before Python startup on some Windows systems.
-python -m nuitka ^
+"%BUILD_PYTHON%" -m nuitka ^
     --onefile ^
     --include-raw-dir=luna_builds=luna_builds ^
     --include-raw-dir=deep_translator=deep_translator ^
