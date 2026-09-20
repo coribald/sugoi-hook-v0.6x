@@ -145,6 +145,8 @@ If behavior looks wrong, inspect:
 ## Lifecycle / Stability Notes
 
 - Plugin reload and app shutdown now call plugin `on_disable()` and remove plugin modules from `sys.modules`.
+- Luna subprocesses use generation-bound sessions so stale readers and exits cannot affect a newer attachment.
+- Luna stdout/stderr are drained by session-specific workers, detach is asynchronous, and unexpected process exit resets the UI state.
 - This cleaned up stale sessions/windows/timers and made reload/close behavior more intentional.
 - We deliberately did not pursue some lower-value branching behavior in the clipboard path to avoid destabilizing the now-stable pipeline.
 

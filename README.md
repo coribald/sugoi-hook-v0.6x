@@ -9,6 +9,7 @@ A fork of SugoiHook - a Windows GUI for attaching to game processes, selecting t
 ## Recent Changes
 
 - Converted the app to a Luna-only hook engine build and removed Textractor packaging/runtime paths.
+- Hardened Luna attach/detach with generation-bound readers, stderr draining, asynchronous termination, and unexpected-exit cleanup.
 - Renamed the plugin base layer from `TextractorPlugin` to `HookPlugin` and cleaned up Luna-only app naming.
 - Reworked the old Google plugin into a configurable `Deep Translator` plugin with reactive provider-specific settings.
 - Moved the vendored translation package to top-level `deep_translator/` and removed the old `Translator/` wrapper folder.
@@ -272,6 +273,8 @@ OpenAI logging only emits when the app itself is running in debug mode, and the 
 ```text
 sugoi-hook/
 ├── SugoiHook_gui.py
+├── luna_session.py
+├── output_pipeline.py
 ├── dictionary_backend.py
 ├── dictionaries/
 ├── plugins/
