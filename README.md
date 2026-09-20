@@ -103,6 +103,12 @@ For verbose runtime logging:
 
 - `python SugoiHook_gui.py --debug`
 
+### Run Tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
 ### Build Executables
 
 Release onefile build:

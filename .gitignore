@@ -36,10 +36,6 @@ Luna Hook GUI/
 SugoiHook_builds/
 Bundled_SugoiHook/
 
-# Test files
-test/
-test_*.py
-
 # Backup files
 *_backup.py
 *.bak
