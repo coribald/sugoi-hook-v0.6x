@@ -155,6 +155,16 @@ class HookConcatenationPlugin(HookPlugin):
                 pending_prefix = str(pending_prefix_values.get(hook_id, '')).strip()
                 pending_continuation = (self._state.get('pending_dialogue_continuation') or '').strip()
                 continuation_at = float(self._state.get('pending_dialogue_continuation_at') or now)
+                if pending_prefix and hook_text.startswith(pending_prefix) and hook_text != pending_prefix:
+                    cumulative_prefix = hook_text
+                    hook_text = hook_text[len(pending_prefix):].strip()
+                    self._log_debug(
+                        'split_cumulative_prefix',
+                        hook_id=hook_id,
+                        previous=pending_prefix,
+                        cumulative=cumulative_prefix,
+                        incoming=hook_text,
+                    )
                 if not pending_prefix or pending_prefix == hook_text:
                     continuation_resolved = self._consume_pending_dialogue_continuation(config)
                     if hook_text:

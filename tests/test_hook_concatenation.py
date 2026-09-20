@@ -120,6 +120,22 @@ class HookConcatenationRegressionTests(unittest.TestCase):
         app.run_callback(handle)
         self.assertEqual(app.outputs, [("ボブボブの台詞。\n", True, True)])
 
+    def test_cumulative_prefix_payload_splits_the_next_speaker_name(self):
+        plugin, app = self.make_plugin("1")
+
+        plugin.process_text("[Hook #1] タイラ\n")
+        plugin.process_text("[Hook #2] タイラの台詞。\n")
+        plugin.process_text("[Hook #2] 続きの台詞。\n")
+        plugin.process_text("[Hook #1] タイラ\n")
+        output = plugin.process_text("[Hook #1] タイラミア\n")
+
+        self.assertEqual(output, "タイラタイラの台詞。続きの台詞。\n")
+        self.assertEqual(plugin._state["hook_buffers"]["1"], "ミア")
+
+        self.assertIsNone(plugin.process_text("[Hook #2] ミアの台詞。\n"))
+        app.run_callback(plugin._state["pending_timer_id"])
+        self.assertEqual(app.outputs, [("ミアミアの台詞。\n", True, True)])
+
     def test_dialogue_only_clipboard_stays_separate_from_combined_display(self):
         plugin, app = self.make_plugin("1")
         plugin.set_setting("clipboard_output_mode", "dialogue_only")
