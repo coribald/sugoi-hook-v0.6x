@@ -25,6 +25,7 @@ from json_persistence import JsonPersistenceError, load_json_object, save_json_o
 from luna_session import LunaProcessSession
 from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
+from plugin_pipeline import PluginPipeline
 from runtime_context import resolve_runtime_context
 from ui_dispatcher import UIThreadDispatcher
 
@@ -312,6 +313,7 @@ class SugoiHookGUI:
         self.output_processing_lock = threading.RLock()
         self.ui_dispatcher = UIThreadDispatcher(self.root)
         self.ui_dispatcher.start()
+        self.plugin_pipeline = PluginPipeline(self, lambda: PLUGINS_AVAILABLE)
         self.output_pipeline = OutputPipeline(
             prepare=self.prepare_plugin_output_bundle,
             complete=self.complete_plugin_output_bundle,
@@ -480,6 +482,11 @@ class SugoiHookGUI:
     def run_on_ui_thread(self, callback, *args):
         """Run a callback on the Tk UI thread."""
         self.ui_dispatcher.dispatch(callback, *args)
+
+    def _get_plugin_pipeline(self):
+        if getattr(self, 'plugin_pipeline', None) is None:
+            self.plugin_pipeline = PluginPipeline(self, lambda: PLUGINS_AVAILABLE)
+        return self.plugin_pipeline
 
     def drain_ui_callbacks(self):
         """Compatibility delegate for callers that manually drain the queue."""
@@ -1135,6 +1142,7 @@ class SugoiHookGUI:
     
     def run_pre_translation_plugins(self, text):
         """Run the shared pre-translation plugin pipeline and collect later phases."""
+        return self._get_plugin_pipeline().run_pre_translation(text)
         if not PLUGINS_AVAILABLE:
             return text, text, [], []
 
@@ -1188,6 +1196,7 @@ class SugoiHookGUI:
         return current_text, clipboard_text, translation_plugins, post_translation_plugins
 
     def is_translation_worthy_output(self, text):
+        return self._get_plugin_pipeline().translation_worthy(text)
         stripped = text.strip() if isinstance(text, str) else text
         if not stripped:
             return False
@@ -1201,6 +1210,7 @@ class SugoiHookGUI:
 
     def prepare_plugin_output_bundle(self, text, allow_auto_copy=False):
         """Run every stateful pre-translation plugin in lossless arrival order."""
+        return self._get_plugin_pipeline().prepare(text, allow_auto_copy)
         with self.output_processing_lock:
             current_text, clipboard_pre_translation, translation_plugins, post_translation_plugins = self.run_pre_translation_plugins(text)
         if current_text is None:
@@ -1250,10 +1260,12 @@ class SugoiHookGUI:
         return prepared
 
     def prepared_output_requires_translation(self, prepared):
+        return self._get_plugin_pipeline().requires_translation(prepared)
         return bool(prepared['translation_plugins'])
 
     def complete_plugin_output_bundle(self, prepared):
         """Translate only the newest prepared logical line and run later plugins."""
+        return self._get_plugin_pipeline().complete(prepared)
         current_text = prepared['current_text']
         translator_input = prepared['translator_input']
         clipboard_text = prepared['clipboard_text']
@@ -1300,6 +1312,7 @@ class SugoiHookGUI:
         return display_text, clipboard_text
 
     def remember_translation_context(self, prepared):
+        return self._get_plugin_pipeline().remember_context(prepared)
         translator_input = prepared['translator_input']
         for plugin in prepared['translation_plugins']:
             try:
