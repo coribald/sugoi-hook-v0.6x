@@ -26,6 +26,7 @@ from luna_session import LunaProcessSession
 from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
+from game_profile_store import GameProfileStore
 from runtime_context import resolve_runtime_context
 from ui_dispatcher import UIThreadDispatcher
 
@@ -403,6 +404,7 @@ class SugoiHookGUI:
         self.plugins_folder = self.runtime_context.user_plugins_dir
         self.plugins_config_path = self.runtime_context.plugins_config_path
         self.game_profiles_path = self.runtime_context.game_profiles_path
+        self.game_profile_store = GameProfileStore(self.game_profiles_path, validator=is_valid_game_profiles, issue_reporter=self.report_config_issue)
         
         # Engine executable paths
         self.luna_x86_path = self.runtime_context.luna_x86_path
@@ -487,6 +489,15 @@ class SugoiHookGUI:
         if getattr(self, 'plugin_pipeline', None) is None:
             self.plugin_pipeline = PluginPipeline(self, lambda: PLUGINS_AVAILABLE)
         return self.plugin_pipeline
+
+    def _get_game_profile_store(self):
+        if getattr(self, 'game_profile_store', None) is None:
+            self.game_profile_store = GameProfileStore(
+                getattr(self, 'game_profiles_path', None),
+                validator=is_valid_game_profiles,
+                issue_reporter=self.report_config_issue,
+            )
+        return self.game_profile_store
 
     def drain_ui_callbacks(self):
         """Compatibility delegate for callers that manually drain the queue."""
@@ -2163,6 +2174,11 @@ class SugoiHookGUI:
 
     def commit_game_profiles(self, updated_profiles):
         """Persist a complete profile snapshot, retaining old state on failure."""
+        store = self._get_game_profile_store()
+        store.profiles = self.game_profiles
+        saved = store.commit(updated_profiles)
+        self.game_profiles = store.profiles
+        return saved
         previous_profiles = self.game_profiles
         self.game_profiles = updated_profiles
         if self.save_game_profiles():
@@ -2174,6 +2190,10 @@ class SugoiHookGUI:
     # ==================== GAME PROFILES SYSTEM METHODS =============    
     def generate_game_id(self, pid):
         """Generate unique identifier for a game based on exe path and size"""
+        try:
+            return self._get_game_profile_store().identity_for_path(psutil.Process(pid).exe())
+        except Exception:
+            return None, None, None
         try:
             proc = psutil.Process(pid)
             exe_path = proc.exe()
@@ -2189,6 +2209,10 @@ class SugoiHookGUI:
     
     def load_game_profiles(self):
         """Load game profiles from JSON file"""
+        store = self._get_game_profile_store()
+        store.path = self.game_profiles_path
+        self.game_profiles = store.load()
+        return self.game_profiles
         self.game_profiles = {}
         if not self.game_profiles_path:
             return
@@ -2210,6 +2234,10 @@ class SugoiHookGUI:
     
     def save_game_profiles(self):
         """Save game profiles to JSON file"""
+        store = self._get_game_profile_store()
+        store.path = self.game_profiles_path
+        store.profiles = self.game_profiles
+        return store.save()
         if not self.game_profiles_path:
             return False
         try:
