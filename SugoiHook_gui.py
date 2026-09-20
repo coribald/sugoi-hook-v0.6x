@@ -24,6 +24,7 @@ from pathlib import Path
 from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_session import LunaProcessSession
 from output_pipeline import OutputPipeline
+from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from runtime_context import resolve_runtime_context
 from ui_dispatcher import UIThreadDispatcher
 
@@ -31,9 +32,6 @@ ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
 EARLY_LOG_STREAM = None
 EARLY_LOG_PATH = None
-DYNAMIC_PLUGIN_PACKAGE = "sugoihook_dynamic_plugins"
-
-
 def is_valid_plugins_config(config):
     return (
         isinstance(config.get('active_plugins', []), list)
@@ -280,15 +278,10 @@ class SugoiHookGUI:
         self.is_fullscreen = False
         
         # Plugin system
-        self.plugins = {}
-        self.active_plugins = []
-        self.plugin_order = []
+        self._plugin_manager = None
         self.plugins_config_path = None
         self.plugins_folder = None
         self.bundled_plugins_folder = None
-        self.plugin_file_paths = {}
-        self.plugin_module_names = {}
-        self.plugin_settings = {}
         self.config_warnings = []
         
         # Game profiles system
@@ -416,6 +409,8 @@ class SugoiHookGUI:
         
         # Luna-only build
         self.current_engine = "luna"
+
+        self._plugin_manager = self._create_plugin_manager()
         
         # Initialize plugin system
         self.init_plugin_system()
@@ -450,6 +445,38 @@ class SugoiHookGUI:
         """Scale a value based on DPI"""
         return int(value * self.scale_factor)
 
+    def _create_plugin_manager(self):
+        return PluginManager(
+            self, plugin_base=globals().get('HookPlugin'), config_path=getattr(self, 'plugins_config_path', None),
+            bundled_dir=getattr(self, 'bundled_plugins_folder', None), user_dir=getattr(self, 'plugins_folder', None),
+            output_lock=getattr(self, 'output_processing_lock', None), config_validator=is_valid_plugins_config,
+            issue_reporter=self.report_config_issue, debug_enabled=runtime_debug_logging_enabled,
+        )
+
+    def _sync_plugin_manager_context(self):
+        manager = self.plugin_manager
+        manager.config_path = getattr(self, 'plugins_config_path', None)
+        manager.bundled_dir = getattr(self, 'bundled_plugins_folder', None)
+        manager.user_dir = getattr(self, 'plugins_folder', None)
+        manager.output_lock = getattr(self, 'output_processing_lock', None)
+        return manager
+
+    @property
+    def plugin_manager(self):
+        if getattr(self, '_plugin_manager', None) is None:
+            self._plugin_manager = self._create_plugin_manager()
+        return self._plugin_manager
+
+    def _plugin_state_property(name):
+        return property(lambda self: getattr(self.plugin_manager, name), lambda self, value: setattr(self.plugin_manager, name, value))
+
+    plugins = _plugin_state_property('plugins')
+    active_plugins = _plugin_state_property('active_plugins')
+    plugin_order = _plugin_state_property('plugin_order')
+    plugin_settings = _plugin_state_property('plugin_settings')
+    plugin_file_paths = _plugin_state_property('plugin_file_paths')
+    plugin_module_names = _plugin_state_property('plugin_module_names')
+
     def run_on_ui_thread(self, callback, *args):
         """Run a callback on the Tk UI thread."""
         self.ui_dispatcher.dispatch(callback, *args)
@@ -461,6 +488,9 @@ class SugoiHookGUI:
     # ==================== PLUGIN SYSTEM METHODS =============    
     def init_plugin_system(self):
         """Initialize the plugin system"""
+        if not PLUGINS_AVAILABLE:
+            return
+        return self._sync_plugin_manager_context().init()
         # Ensure writable custom plugins folder exists regardless of bundled plugin layout
         if not self.plugins_folder.exists():
             self.plugins_folder.mkdir(parents=True, exist_ok=True)
@@ -476,6 +506,7 @@ class SugoiHookGUI:
     
     def discover_plugins(self):
         """Discover all available plugins in the plugins folder"""
+        return self._sync_plugin_manager_context().discover()
         plugin_search_paths = []
         if self.bundled_plugins_folder and self.bundled_plugins_folder.exists():
             plugin_search_paths.append(self.bundled_plugins_folder)
@@ -543,6 +574,7 @@ class SugoiHookGUI:
 
     def load_plugins_config(self):
         """Load plugin configuration from JSON file"""
+        return self._sync_plugin_manager_context().load_config()
         self.active_plugins = []
         self.plugin_order = []
         self.plugin_settings = {}
@@ -571,6 +603,7 @@ class SugoiHookGUI:
     
     def save_plugins_config(self):
         """Save plugin configuration to JSON file"""
+        return self._sync_plugin_manager_context().save_config()
         if not self.plugins_config_path:
             return False
         # Ensure plugin_order reflects all known plugins if empty
@@ -916,6 +949,9 @@ class SugoiHookGUI:
         """Load a single plugin from a file path"""
         if not PLUGINS_AVAILABLE:
             return None
+        return self._sync_plugin_manager_context().load(plugin_path)
+        if not PLUGINS_AVAILABLE:
+            return None
         plugin_path = Path(plugin_path)
         module_name = self.get_plugin_module_name(plugin_path)
         try:
@@ -959,6 +995,7 @@ class SugoiHookGUI:
 
     def ensure_dynamic_plugin_package(self):
         """Create the private namespace that owns dynamically loaded plugins."""
+        return self.plugin_manager._ensure_package()
         package = sys.modules.get(DYNAMIC_PLUGIN_PACKAGE)
         if package is None:
             package = types.ModuleType(DYNAMIC_PLUGIN_PACKAGE)
@@ -966,6 +1003,7 @@ class SugoiHookGUI:
             sys.modules[DYNAMIC_PLUGIN_PACKAGE] = package
 
     def get_plugin_module_name(self, plugin_path):
+        return self.plugin_manager.module_name(plugin_path)
         resolved_path = str(Path(plugin_path).resolve()).casefold()
         safe_stem = re.sub(r'\W+', '_', Path(plugin_path).stem).strip('_') or 'plugin'
         path_hash = hashlib.sha256(resolved_path.encode('utf-8')).hexdigest()[:16]
@@ -973,6 +1011,7 @@ class SugoiHookGUI:
 
     def unload_plugin(self, plugin_filename):
         """Disable one plugin and remove only its tracked dynamic module."""
+        return self.plugin_manager.unload(plugin_filename)
         plugin = self.plugins.get(plugin_filename)
         if plugin is not None:
             try:
@@ -992,6 +1031,7 @@ class SugoiHookGUI:
     
     def activate_plugin(self, plugin_filename):
         """Activate a plugin"""
+        return self._sync_plugin_manager_context().activate(plugin_filename)
         with self.output_processing_lock:
             if plugin_filename in self.plugins and plugin_filename not in self.active_plugins:
                 self.active_plugins.append(plugin_filename)
@@ -1020,6 +1060,7 @@ class SugoiHookGUI:
     
     def deactivate_plugin(self, plugin_filename):
         """Deactivate a plugin"""
+        return self._sync_plugin_manager_context().deactivate(plugin_filename)
         with self.output_processing_lock:
             if plugin_filename in self.active_plugins:
                 active_index = self.active_plugins.index(plugin_filename)
@@ -1083,6 +1124,7 @@ class SugoiHookGUI:
 
     def shutdown_plugin_instances(self):
         """Run plugin teardown and clear dynamically loaded plugin modules."""
+        return self.plugin_manager.shutdown()
         plugin_filenames = list(self.plugins.keys())
 
         for plugin_filename in plugin_filenames:
@@ -2050,6 +2092,7 @@ class SugoiHookGUI:
 
     def apply_plugin_settings(self, plugin_filename, plugin, draft_values):
         """Apply plugin settings and retain only values the plugin accepted."""
+        return self._sync_plugin_manager_context().apply_settings(plugin_filename, plugin, draft_values)
         accepted_values = {}
         with self.output_processing_lock:
             for setting_name, value in draft_values.items():
@@ -2070,6 +2113,12 @@ class SugoiHookGUI:
 
     def save_plugin_settings_transactionally(self, plugin_filename, plugin, draft_values, require_all=False):
         """Apply settings and roll runtime state back if persistence fails."""
+        saved, accepted = self._sync_plugin_manager_context().save_settings_transactionally(
+            plugin_filename, plugin, draft_values, require_all
+        )
+        if require_all and not saved:
+            self.notify_user("One or more plugin settings were rejected; no changes were saved.", level='warning')
+        return saved, accepted
         previous_persisted_exists = plugin_filename in self.plugin_settings
         previous_persisted = copy.deepcopy(self.plugin_settings.get(plugin_filename, {}))
         current_settings = plugin.get_settings()

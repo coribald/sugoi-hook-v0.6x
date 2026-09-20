@@ -275,7 +275,7 @@ plugin = FailingPlugin()
             app.bundled_plugins_folder = None
             app.plugins_folder = Path(directory)
             saved = []
-            app.save_plugins_config = lambda: saved.append(True) or True
+            app.plugin_manager.save_config = lambda: saved.append(True) or True
 
             with self.assertLogs(level="ERROR") as logs:
                 app.discover_plugins()
