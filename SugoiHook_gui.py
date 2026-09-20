@@ -25,6 +25,7 @@ from pathlib import Path
 from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_session import LunaProcessSession
 from output_pipeline import OutputPipeline
+from runtime_context import resolve_runtime_context
 
 ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
@@ -52,29 +53,18 @@ def is_valid_game_profiles(config):
 
 
 def get_runtime_launcher_path() -> Path:
-    if getattr(sys, 'frozen', False):
-        return Path(sys.executable).resolve()
-
-    argv0 = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
-    executable = Path(sys.executable).resolve()
-
-    if argv0 and argv0.suffix.lower() == '.exe' and argv0 != executable:
-        return argv0
-
-    if executable.suffix.lower() == '.exe' and 'python' not in executable.name.lower():
-        return executable
-
-    return Path(__file__).resolve()
+    """Compatibility delegate for legacy callers and early bootstrap."""
+    return resolve_runtime_context(module_path=__file__).launcher_path
 
 
 def get_runtime_bundle_base_path() -> Path:
-    if getattr(sys, 'frozen', False) or getattr(sys, '__compiled__', False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    """Compatibility delegate for legacy callers and early bootstrap."""
+    return resolve_runtime_context(module_path=__file__).runtime_bundle_base_path
 
 
 def get_runtime_user_data_path() -> Path:
-    return get_runtime_launcher_path().parent
+    """Compatibility delegate for legacy callers and early bootstrap."""
+    return resolve_runtime_context(module_path=__file__).user_data_dir
 
 
 def runtime_debug_logging_enabled() -> bool:
@@ -403,34 +393,28 @@ class SugoiHookGUI:
         }
         
         # Determine CLI paths - handle both development and compiled modes
-        launcher_path = get_runtime_launcher_path()
-        is_frozen = getattr(sys, 'frozen', False)
-        is_nuitka = getattr(sys, '__compiled__', False) or (
-            launcher_path.suffix.lower() == '.exe' and
-            launcher_path.resolve() != Path(__file__).resolve()
-        )
-        is_compiled = is_frozen or is_nuitka
-        
-        # Set base paths based on compilation mode
-        if is_compiled:
-            self.base_path = Path(sys._MEIPASS) if is_frozen else get_runtime_bundle_base_path()
-            self.app_path = get_runtime_user_data_path()
-            self.user_data_dir = self.app_path
+        self.runtime_context = resolve_runtime_context(module_path=__file__)
+
+        # Set paths from the single immutable runtime context.
+        if self.runtime_context.is_compiled:
+            self.base_path = self.runtime_context.asset_base_path
+            self.app_path = self.runtime_context.user_data_dir
+            self.user_data_dir = self.runtime_context.user_data_dir
             self.user_data_dir.mkdir(parents=True, exist_ok=True)
         else:
-            self.base_path = self.app_path = Path(__file__).parent
-            self.user_data_dir = self.app_path
+            self.base_path = self.app_path = self.runtime_context.asset_base_path
+            self.user_data_dir = self.runtime_context.user_data_dir
         
         # Configure plugin and profile paths
-        self.bundled_plugins_folder = self.base_path / "plugins"
-        self.plugins_folder = self.user_data_dir / "plugins"
-        self.plugins_config_path = self.user_data_dir / "plugins_config.json"
-        self.game_profiles_path = self.user_data_dir / "game_profiles.json"
+        self.bundled_plugins_folder = self.runtime_context.bundled_plugins_dir
+        self.plugins_folder = self.runtime_context.user_plugins_dir
+        self.plugins_config_path = self.runtime_context.plugins_config_path
+        self.game_profiles_path = self.runtime_context.game_profiles_path
         
         # Engine executable paths
-        self.luna_x86_path = self.base_path / "luna_builds" / "LunaHostCLI32.exe"
-        self.luna_x64_path = self.base_path / "luna_builds" / "LunaHostCLI64.exe"
-        self.logo_path = self.base_path / "logo.webp"
+        self.luna_x86_path = self.runtime_context.luna_x86_path
+        self.luna_x64_path = self.runtime_context.luna_x64_path
+        self.logo_path = self.runtime_context.logo_path
         
         # Luna-only build
         self.current_engine = "luna"

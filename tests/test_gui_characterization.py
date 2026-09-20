@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import SugoiHook_gui as gui
 from luna_session import LunaProcessSession
+from runtime_context import resolve_runtime_context
 
 
 gui.sys.stdout = gui.ORIGINAL_STDOUT
@@ -32,6 +33,51 @@ class RecordingRoot:
 
 
 class RuntimePathCharacterizationTests(unittest.TestCase):
+    def test_context_owns_all_source_runtime_paths(self):
+        module_path = Path(r"C:\\Source\\SugoiHook_gui.py")
+        context = resolve_runtime_context(
+            argv=[str(module_path)],
+            executable=r"C:\\Python311\\python.exe",
+            module_path=module_path,
+            frozen=False,
+            compiled=False,
+        )
+
+        self.assertFalse(context.is_compiled)
+        self.assertEqual(context.launcher_path, module_path)
+        self.assertEqual(context.runtime_bundle_base_path, module_path.parent)
+        self.assertEqual(context.asset_base_path, module_path.parent)
+        self.assertEqual(context.user_data_dir, module_path.parent)
+        self.assertEqual(context.bundled_plugins_dir, module_path.parent / "plugins")
+        self.assertEqual(context.user_plugins_dir, module_path.parent / "plugins")
+        self.assertEqual(context.plugins_config_path, module_path.parent / "plugins_config.json")
+        self.assertEqual(context.game_profiles_path, module_path.parent / "game_profiles.json")
+        self.assertEqual(context.luna_x86_path, module_path.parent / "luna_builds" / "LunaHostCLI32.exe")
+        self.assertEqual(context.luna_x64_path, module_path.parent / "luna_builds" / "LunaHostCLI64.exe")
+        self.assertEqual(context.logo_path, module_path.parent / "logo.webp")
+
+    def test_context_keeps_frozen_assets_separate_from_persistent_user_data(self):
+        executable = Path(r"C:\\Release\\SugoiHook.exe")
+        asset_base = Path(r"C:\\Temp\\onefile-assets")
+        context = resolve_runtime_context(
+            argv=[str(executable)],
+            executable=executable,
+            module_path=r"C:\\Source\\SugoiHook_gui.py",
+            frozen=True,
+            compiled=False,
+            meipass=asset_base,
+        )
+
+        self.assertTrue(context.is_frozen)
+        self.assertTrue(context.is_compiled)
+        self.assertEqual(context.launcher_path, executable)
+        self.assertEqual(context.runtime_bundle_base_path, executable.parent)
+        self.assertEqual(context.asset_base_path, asset_base)
+        self.assertEqual(context.user_data_dir, executable.parent)
+        self.assertEqual(context.bundled_plugins_dir, asset_base / "plugins")
+        self.assertEqual(context.user_plugins_dir, executable.parent / "plugins")
+        self.assertEqual(context.luna_x64_path, asset_base / "luna_builds" / "LunaHostCLI64.exe")
+
     def test_source_runtime_uses_the_gui_module_directory(self):
         expected = Path(gui.__file__).resolve().parent
         with patch.object(gui.sys, "frozen", False, create=True), \
