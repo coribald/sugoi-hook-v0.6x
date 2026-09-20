@@ -20,6 +20,7 @@ import traceback
 from collections import deque
 from pathlib import Path
 
+from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_session import LunaProcessSession
 from output_pipeline import OutputPipeline
 
@@ -27,6 +28,24 @@ ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
 EARLY_LOG_STREAM = None
 EARLY_LOG_PATH = None
+
+
+def is_valid_plugins_config(config):
+    return (
+        isinstance(config.get('active_plugins', []), list)
+        and all(isinstance(name, str) for name in config.get('active_plugins', []))
+        and isinstance(config.get('plugin_order', []), list)
+        and all(isinstance(name, str) for name in config.get('plugin_order', []))
+        and isinstance(config.get('plugin_settings', {}), dict)
+        and all(isinstance(name, str) and isinstance(settings, dict)
+                for name, settings in config.get('plugin_settings', {}).items())
+        and (config.get('window_geometry') is None or isinstance(config.get('window_geometry'), str))
+        and (config.get('compact_window_geometry') is None or isinstance(config.get('compact_window_geometry'), str))
+    )
+
+
+def is_valid_game_profiles(config):
+    return all(isinstance(game_id, str) and isinstance(profile, dict) for game_id, profile in config.items())
 
 
 def get_runtime_launcher_path() -> Path:
@@ -276,6 +295,7 @@ class SugoiHookGUI:
         self.bundled_plugins_folder = None
         self.plugin_file_paths = {}
         self.plugin_settings = {}
+        self.config_warnings = []
         
         # Game profiles system
         self.game_profiles = {}
@@ -429,6 +449,7 @@ class SugoiHookGUI:
         self.set_window_icon()
         self.create_status_bar()
         self.setup_ui()
+        self.show_pending_config_warnings()
         self.setup_system_tray()
         self.refresh_processes()
         self.update_status_bar()
@@ -552,42 +573,62 @@ class SugoiHookGUI:
         self.plugin_order = []
         self.plugin_settings = {}
         
-        if self.plugins_config_path and self.plugins_config_path.exists():
-            try:
-                with open(self.plugins_config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    self.active_plugins = config.get('active_plugins', [])
-                    self.plugin_order = config.get('plugin_order', [])
-                    self.plugin_settings = config.get('plugin_settings', {})
-                    self.window_geometry = config.get('window_geometry')
-                    self.compact_window_geometry = config.get('compact_window_geometry')
-            except Exception:
-                pass
+        if not self.plugins_config_path:
+            return
+        try:
+            config, recovered_from_backup = load_json_object(
+                self.plugins_config_path, is_valid_plugins_config
+            )
+        except JsonPersistenceError as error:
+            self.report_config_issue(self.plugins_config_path, error)
+            return
+        if config is None:
+            return
+        if recovered_from_backup:
+            self.report_config_issue(
+                self.plugins_config_path,
+                "the primary file was invalid; recovered the last valid saved settings",
+            )
+        self.active_plugins = config.get('active_plugins', [])
+        self.plugin_order = config.get('plugin_order', [])
+        self.plugin_settings = config.get('plugin_settings', {})
+        self.window_geometry = config.get('window_geometry')
+        self.compact_window_geometry = config.get('compact_window_geometry')
     
     def save_plugins_config(self):
         """Save plugin configuration to JSON file"""
-        if self.plugins_config_path:
-            try:
-                # Ensure plugin_order reflects all known plugins if empty
-                if not self.plugin_order:
-                    self.plugin_order = sorted(list(self.plugins.keys()))
-                
-                config = {
-                    'active_plugins': self.active_plugins,
-                    'plugin_order': self.plugin_order,
-                    'plugin_settings': self.plugin_settings,
-                    'window_geometry': self.window_geometry,
-                    'compact_window_geometry': self.compact_window_geometry,
-                }
-                
-                # Ensure directory exists
-                if not self.plugins_config_path.parent.exists():
-                    self.plugins_config_path.parent.mkdir(parents=True, exist_ok=True)
-                    
-                with open(self.plugins_config_path, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=2)
-            except Exception:
-                pass
+        if not self.plugins_config_path:
+            return False
+        # Ensure plugin_order reflects all known plugins if empty
+        if not self.plugin_order:
+            self.plugin_order = sorted(list(self.plugins.keys()))
+        config = {
+            'active_plugins': self.active_plugins,
+            'plugin_order': self.plugin_order,
+            'plugin_settings': self.plugin_settings,
+            'window_geometry': self.window_geometry,
+            'compact_window_geometry': self.compact_window_geometry,
+        }
+        try:
+            save_json_object_atomic(self.plugins_config_path, config, is_valid_plugins_config)
+            return True
+        except JsonPersistenceError as error:
+            self.report_config_issue(self.plugins_config_path, error)
+            return False
+
+    def report_config_issue(self, path, error):
+        message = f"Could not use saved settings in {Path(path).name}: {error}"
+        logging.warning(message)
+        self.config_warnings.append(message)
+        if hasattr(self, 'status_notice_label'):
+            self.notify_user("Could not save or load settings. See the runtime log for details.", level='warning', timeout_ms=7000)
+
+    def show_pending_config_warnings(self):
+        if not self.config_warnings:
+            return
+        self.append_event("⚠️ Some saved settings could not be loaded. See the runtime log for details.\n")
+        self.notify_user("Some saved settings could not be loaded.", level='warning', timeout_ms=7000)
+        self.config_warnings.clear()
 
     def apply_saved_window_geometry(self):
         """Restore the last saved main window size and position."""
@@ -1937,21 +1978,20 @@ class SugoiHookGUI:
         btn_card.grid(row=3, column=0, sticky="ew")
 
         def save_settings():
-            if plugin_filename not in self.plugin_settings:
-                self.plugin_settings[plugin_filename] = {}
-
             collect_current_draft_values()
+            accepted_values = self.apply_plugin_settings(plugin_filename, plugin, draft_values)
 
-            with self.output_processing_lock:
-                for setting_name, value in draft_values.items():
-                    plugin.set_setting(setting_name, value)
-                    self.plugin_settings[plugin_filename][setting_name] = value
-
-            self.save_plugins_config()
+            if not self.save_plugins_config():
+                self.notify_user("Could not save plugin settings. See the runtime log for details.", level='warning')
+                return
             self.update_hook_status_panel()
             self.update_hook_action_state()
             canvas.unbind_all("<MouseWheel>")
-            self.notify_user(f"Saved settings for {plugin_name}.", level='success')
+            rejected_count = len(draft_values) - len(accepted_values)
+            if rejected_count:
+                self.notify_user(f"Saved accepted settings for {plugin_name}; {rejected_count} invalid setting(s) were not saved.", level='warning')
+            else:
+                self.notify_user(f"Saved settings for {plugin_name}.", level='success')
             dialog.destroy()
 
         def cancel():
@@ -1968,6 +2008,26 @@ class SugoiHookGUI:
         y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
         dialog.geometry(f"+{x}+{y}")
         dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+    def apply_plugin_settings(self, plugin_filename, plugin, draft_values):
+        """Apply plugin settings and retain only values the plugin accepted."""
+        accepted_values = {}
+        with self.output_processing_lock:
+            for setting_name, value in draft_values.items():
+                try:
+                    if plugin.set_setting(setting_name, value):
+                        accepted_values[setting_name] = value
+                    else:
+                        logging.warning("Plugin %s rejected setting %s", plugin_filename, setting_name)
+                except Exception:
+                    logging.exception("Plugin %s failed to apply setting %s", plugin_filename, setting_name)
+            persisted_values = self.plugin_settings.setdefault(plugin_filename, {})
+            for setting_name in draft_values:
+                persisted_values.pop(setting_name, None)
+            persisted_values.update(accepted_values)
+            if not persisted_values:
+                self.plugin_settings.pop(plugin_filename, None)
+        return accepted_values
 
     # ==================== END PLUGIN SYSTEM METHODS =============    
     # ==================== GAME PROFILES SYSTEM METHODS =============    
@@ -1989,25 +2049,34 @@ class SugoiHookGUI:
     def load_game_profiles(self):
         """Load game profiles from JSON file"""
         self.game_profiles = {}
-        if self.game_profiles_path and self.game_profiles_path.exists():
-            try:
-                with open(self.game_profiles_path, 'r', encoding='utf-8') as f:
-                    self.game_profiles = json.load(f)
-            except Exception:
-                pass
+        if not self.game_profiles_path:
+            return
+        try:
+            profiles, recovered_from_backup = load_json_object(
+                self.game_profiles_path, is_valid_game_profiles
+            )
+        except JsonPersistenceError as error:
+            self.report_config_issue(self.game_profiles_path, error)
+            return
+        if profiles is None:
+            return
+        if recovered_from_backup:
+            self.report_config_issue(
+                self.game_profiles_path,
+                "the primary file was invalid; recovered the last valid saved profiles",
+            )
+        self.game_profiles = profiles
     
     def save_game_profiles(self):
         """Save game profiles to JSON file"""
-        if self.game_profiles_path:
-            try:
-                # Ensure directory exists
-                if not self.game_profiles_path.parent.exists():
-                    self.game_profiles_path.parent.mkdir(parents=True, exist_ok=True)
-                    
-                with open(self.game_profiles_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.game_profiles, f, indent=2)
-            except Exception:
-                pass
+        if not self.game_profiles_path:
+            return False
+        try:
+            save_json_object_atomic(self.game_profiles_path, self.game_profiles, is_valid_game_profiles)
+            return True
+        except JsonPersistenceError as error:
+            self.report_config_issue(self.game_profiles_path, error)
+            return False
     
     def save_hook_profile(self, hook_id=None, hook_code=None):
         """Save current hook selection to game profile"""

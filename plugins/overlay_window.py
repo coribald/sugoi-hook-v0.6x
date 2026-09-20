@@ -11,6 +11,8 @@ import re
 import logging
 from pathlib import Path
 
+from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
+
 DICTIONARY_LOOKUP_CHAR_PATTERN = re.compile(r'[一-龯々〆ヶぁ-ゖァ-ヺー]')
 
 FRIENDLY_RULE_LABELS = {
@@ -138,12 +140,14 @@ class OverlayWindowPlugin(HookPlugin):
         """Load configuration from JSON file"""
         try:
             config_path = self.get_config_path()
-            if config_path.exists():
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    saved_config = json.load(f)
-                    self.config.update(saved_config)
-        except Exception:
-            pass
+            saved_config, recovered_from_backup = load_json_object(config_path, self._is_valid_config)
+        except JsonPersistenceError as error:
+            self._report_config_issue(error)
+            return
+        if saved_config is not None:
+            self.config.update(saved_config)
+        if recovered_from_backup:
+            self._report_config_issue("the primary file was invalid; recovered the last valid overlay settings")
 
     def _apply_dictionary_defaults(self):
         for key, value in self.DICTIONARY_DEFAULTS.items():
@@ -153,11 +157,27 @@ class OverlayWindowPlugin(HookPlugin):
         """Save configuration to JSON file"""
         try:
             config_path = self.get_config_path()
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2)
-        except Exception:
-            pass
+            save_json_object_atomic(config_path, self.config, self._is_valid_config)
+            return True
+        except JsonPersistenceError as error:
+            self._report_config_issue(error)
+            return False
+
+    def _report_config_issue(self, error):
+        config_path = self.get_config_path()
+        message = f"Could not use saved overlay settings in {config_path.name}: {error}"
+        logging.warning(message)
+        app = getattr(self, 'app', None)
+        if app is not None and hasattr(app, 'report_config_issue'):
+            app.report_config_issue(config_path, error)
+
+    def _is_valid_config(self, config):
+        if not all(isinstance(key, str) for key in config):
+            return False
+        for key, value in config.items():
+            if key in self.config and type(value) is not type(self.config[key]):
+                return False
+        return True
 
     def get_config_path(self) -> Path:
         app = getattr(self, 'app', None)
