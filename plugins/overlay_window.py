@@ -230,6 +230,7 @@ class OverlayWindowPlugin(HookPlugin):
         try:
             self.overlay = tk.Toplevel()
         except Exception:
+            logging.exception("Failed to create overlay window")
             return
 
         self.overlay.title("Text Overlay")
@@ -398,11 +399,11 @@ class OverlayWindowPlugin(HookPlugin):
             self.capture_overlay_geometry()
             self.flush_save_config()
         except Exception:
-            pass
+            logging.exception("Failed to persist overlay state while hiding")
         try:
             self.overlay.withdraw()
         except Exception:
-            pass
+            logging.exception("Failed to hide overlay window")
 
     def do_move(self, event):
         deltax = event.x - self.drag_data["x"]
@@ -694,6 +695,7 @@ class OverlayWindowPlugin(HookPlugin):
             click_offset = int(self.text_widget.count("1.0", click_index, "chars")[0])
             full_text = self.text_widget.get("1.0", "end-1c")
         except Exception:
+            logging.exception("Failed to resolve overlay dictionary click position")
             self._debug("lookup_failed", reason="index_resolution_failed")
             return
 

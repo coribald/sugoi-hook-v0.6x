@@ -189,6 +189,62 @@ class PersistenceRegressionTests(unittest.TestCase):
         self.assertFalse(plugin.enabled)
         self.assertEqual((plugin.enable_count, plugin.disable_count), (1, 1))
 
+    def test_failed_plugin_enable_rolls_back_runtime_state(self):
+        class FailingPlugin:
+            def __init__(self):
+                self.enabled = False
+                self.disable_count = 0
+
+            def on_enable(self):
+                raise RuntimeError("enable failed")
+
+            def on_disable(self):
+                self.disable_count += 1
+
+        plugin = FailingPlugin()
+        app = gui.SugoiHookGUI.__new__(gui.SugoiHookGUI)
+        app.output_processing_lock = threading.RLock()
+        app.plugins = {"plugin.py": plugin}
+        app.active_plugins = []
+        app.save_plugins_config = lambda: True
+
+        with self.assertLogs(level="ERROR") as logs:
+            activated = app.activate_plugin("plugin.py")
+
+        self.assertFalse(activated)
+        self.assertEqual(app.active_plugins, [])
+        self.assertFalse(plugin.enabled)
+        self.assertEqual(plugin.disable_count, 1)
+        self.assertTrue(any("Failed to enable plugin: plugin.py" in message for message in logs.output))
+
+    def test_failed_plugin_disable_restores_runtime_state(self):
+        class FailingPlugin:
+            def __init__(self):
+                self.enabled = True
+                self.enable_count = 0
+
+            def on_enable(self):
+                self.enable_count += 1
+
+            def on_disable(self):
+                raise RuntimeError("disable failed")
+
+        plugin = FailingPlugin()
+        app = gui.SugoiHookGUI.__new__(gui.SugoiHookGUI)
+        app.output_processing_lock = threading.RLock()
+        app.plugins = {"plugin.py": plugin}
+        app.active_plugins = ["plugin.py"]
+        app.save_plugins_config = lambda: True
+
+        with self.assertLogs(level="ERROR") as logs:
+            deactivated = app.deactivate_plugin("plugin.py")
+
+        self.assertFalse(deactivated)
+        self.assertEqual(app.active_plugins, ["plugin.py"])
+        self.assertTrue(plugin.enabled)
+        self.assertEqual(plugin.enable_count, 1)
+        self.assertTrue(any("Failed to disable plugin: plugin.py" in message for message in logs.output))
+
     def test_overlay_setting_rolls_back_when_overlay_config_save_fails(self):
         plugin = OverlayWindowPlugin.__new__(OverlayWindowPlugin)
         plugin.config = {"window_opacity": 80}

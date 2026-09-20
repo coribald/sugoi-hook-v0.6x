@@ -1012,7 +1012,7 @@ class SugoiHookGUI:
             try:
                 plugin.enabled = False
             except Exception:
-                pass
+                logging.exception('Failed to mark plugin disabled during unload: %s', plugin_filename)
             try:
                 plugin.on_disable()
             except Exception:
@@ -1030,30 +1030,57 @@ class SugoiHookGUI:
             if plugin_filename in self.plugins and plugin_filename not in self.active_plugins:
                 self.active_plugins.append(plugin_filename)
                 plugin = self.plugins[plugin_filename]
-                plugin.enabled = True
-                plugin.on_enable()
+                try:
+                    plugin.enabled = True
+                    plugin.on_enable()
+                except Exception:
+                    logging.exception('Failed to enable plugin: %s', plugin_filename)
+                    self.active_plugins.remove(plugin_filename)
+                    try:
+                        plugin.enabled = False
+                        plugin.on_disable()
+                    except Exception:
+                        logging.exception('Failed to clean up plugin after enable failure: %s', plugin_filename)
+                    return False
                 if self.save_plugins_config():
                     return True
                 self.active_plugins.remove(plugin_filename)
-                plugin.enabled = False
-                plugin.on_disable()
+                try:
+                    plugin.enabled = False
+                    plugin.on_disable()
+                except Exception:
+                    logging.exception('Failed to disable plugin after config save failure: %s', plugin_filename)
         return False
     
     def deactivate_plugin(self, plugin_filename):
         """Deactivate a plugin"""
         with self.output_processing_lock:
             if plugin_filename in self.active_plugins:
+                active_index = self.active_plugins.index(plugin_filename)
                 self.active_plugins.remove(plugin_filename)
                 if plugin_filename in self.plugins:
                     plugin = self.plugins[plugin_filename]
-                    plugin.enabled = False
-                    plugin.on_disable()
+                    try:
+                        plugin.enabled = False
+                        plugin.on_disable()
+                    except Exception:
+                        logging.exception('Failed to disable plugin: %s', plugin_filename)
+                        self.active_plugins.insert(active_index, plugin_filename)
+                        try:
+                            plugin.enabled = True
+                            plugin.on_enable()
+                        except Exception:
+                            logging.exception('Failed to restore plugin after disable failure: %s', plugin_filename)
+                        return False
                 if self.save_plugins_config():
                     return True
-                self.active_plugins.append(plugin_filename)
+                self.active_plugins.insert(active_index, plugin_filename)
                 if plugin_filename in self.plugins:
-                    plugin.enabled = True
-                    plugin.on_enable()
+                    try:
+                        plugin.enabled = True
+                        plugin.on_enable()
+                    except Exception:
+                        logging.exception('Failed to restore plugin after config save failure: %s', plugin_filename)
         return False
 
     def _pipeline_preview(self, value, limit=180):
@@ -1144,7 +1171,7 @@ class SugoiHookGUI:
                             self.log_pipeline('pre_translation.clipboard_plugin_result', plugin=plugin_filename, output=clipboard_result)
                         clipboard_text = clipboard_result
                 except Exception:
-                    pass
+                    logging.exception('Pre-translation plugin failed: %s', plugin_filename)
 
         if current_text is None:
             return None, clipboard_text, translation_plugins, post_translation_plugins
@@ -1365,7 +1392,7 @@ class SugoiHookGUI:
                 try:
                     plugin.reset()
                 except Exception:
-                    pass
+                    logging.exception('Failed to reset plugin: %s', getattr(plugin, 'name', type(plugin).__name__))
     
     def open_plugins_folder(self):
         """Open the plugins folder in file explorer"""
@@ -3722,7 +3749,7 @@ class SugoiHookGUI:
             windows = []
             win32gui.EnumWindows(enum_windows_callback, windows)
             return len(windows) > 0
-        except:
+        except Exception:
             # If we can't check, assume it might be valid
             return True
     
@@ -3796,8 +3823,8 @@ class SugoiHookGUI:
                         kernel32.CloseHandle(handle)
                         return "x86" if is_wow64.value else "x64"
                     kernel32.CloseHandle(handle)
-        except:
-            pass
+        except Exception:
+            logging.exception('Failed to set main window icon')
         return "x86"
     
     def refresh_processes(self):
@@ -4895,6 +4922,7 @@ For more information, refer to the Luna Hook documentation and current community
             threading.Thread(target=self.tray_icon.run, daemon=True).start()
             self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         except Exception:
+            logging.exception('Failed to initialize system tray; using direct window close behavior')
             self.tray_icon = None
             self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
     
@@ -4951,16 +4979,34 @@ For more information, refer to the Luna Hook documentation and current community
         self.finish_quit_app()
 
     def finish_quit_app(self):
-        self.output_pipeline.stop()
-        with self.output_processing_lock:
-            self.shutdown_plugin_instances()
+        try:
+            self.output_pipeline.stop()
+        except Exception:
+            logging.exception('Failed to stop output pipeline during shutdown')
+        try:
+            with self.output_processing_lock:
+                self.shutdown_plugin_instances()
+        except Exception:
+            logging.exception('Failed to shut down plugins')
         if TRAY_AVAILABLE and self.tray_icon:
-            self.tray_icon.stop()
-        with self.ui_callback_lock:
-            self.ui_callback_shutdown = True
-            self.ui_callback_queue.clear()
-        self.root.quit()
-        self.root.destroy()
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                logging.exception('Failed to stop system tray icon')
+        try:
+            with self.ui_callback_lock:
+                self.ui_callback_shutdown = True
+                self.ui_callback_queue.clear()
+        except Exception:
+            logging.exception('Failed to clear UI callback queue')
+        try:
+            self.root.quit()
+        except Exception:
+            logging.exception('Failed to quit Tk mainloop')
+        try:
+            self.root.destroy()
+        except Exception:
+            logging.exception('Failed to destroy Tk root window')
     
     def toggle_fullscreen(self, event=None):
         """Toggle fullscreen mode"""
