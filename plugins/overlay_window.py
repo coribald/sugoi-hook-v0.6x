@@ -896,8 +896,11 @@ class OverlayWindowPlugin(HookPlugin):
 
     def set_setting(self, name: str, value) -> bool:
         if name in self.config:
+            previous_value = self.config[name]
             self.config[name] = value
-            self.save_config()
+            if not self.save_config():
+                self.config[name] = previous_value
+                return False
             if self.overlay and self.enabled:
                 self.on_disable()
                 self.on_enable()

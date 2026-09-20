@@ -18,6 +18,7 @@ import hashlib
 import logging
 import traceback
 import types
+import copy
 from collections import deque
 from pathlib import Path
 
@@ -539,11 +540,11 @@ class SugoiHookGUI:
                         logging.warning('Plugin returned no instance: %s', plugin_file.name)
 
                     if plugin and plugin_file.name in self.plugin_settings:
-                        for setting_name, setting_value in self.plugin_settings[plugin_file.name].items():
-                            try:
-                                plugin.set_setting(setting_name, setting_value)
-                            except Exception:
-                                pass
+                        self.apply_plugin_settings(
+                            plugin_file.name,
+                            plugin,
+                            dict(self.plugin_settings[plugin_file.name]),
+                        )
                     
                     # If this plugin was previously active, enable it
                     if plugin and plugin_file.name in self.active_plugins:
@@ -1031,8 +1032,11 @@ class SugoiHookGUI:
                 plugin = self.plugins[plugin_filename]
                 plugin.enabled = True
                 plugin.on_enable()
-                self.save_plugins_config()
-                return True
+                if self.save_plugins_config():
+                    return True
+                self.active_plugins.remove(plugin_filename)
+                plugin.enabled = False
+                plugin.on_disable()
         return False
     
     def deactivate_plugin(self, plugin_filename):
@@ -1044,8 +1048,12 @@ class SugoiHookGUI:
                     plugin = self.plugins[plugin_filename]
                     plugin.enabled = False
                     plugin.on_disable()
-                self.save_plugins_config()
-                return True
+                if self.save_plugins_config():
+                    return True
+                self.active_plugins.append(plugin_filename)
+                if plugin_filename in self.plugins:
+                    plugin.enabled = True
+                    plugin.on_enable()
         return False
 
     def _pipeline_preview(self, value, limit=180):
@@ -1440,7 +1448,9 @@ class SugoiHookGUI:
             return
 
         self.plugin_order[current_index], self.plugin_order[new_index] = self.plugin_order[new_index], self.plugin_order[current_index]
-        self.save_plugins_config()
+        if not self.save_plugins_config():
+            self.plugin_order[current_index], self.plugin_order[new_index] = self.plugin_order[new_index], self.plugin_order[current_index]
+            return
         self.refresh_plugins_list()
 
         for item in self.plugins_tree.get_children():
@@ -1461,12 +1471,15 @@ class SugoiHookGUI:
             self.notify_user("Select a plugin to toggle.", level='warning')
             return
 
+        plugin_name = self.plugins[plugin_filename].name
         if plugin_filename in self.active_plugins:
-            self.deactivate_plugin(plugin_filename)
-            notice = f"Disabled {self.plugins[plugin_filename].name}."
+            if not self.deactivate_plugin(plugin_filename):
+                return
+            notice = f"Disabled {plugin_name}."
         else:
-            self.activate_plugin(plugin_filename)
-            notice = f"Enabled {self.plugins[plugin_filename].name}."
+            if not self.activate_plugin(plugin_filename):
+                return
+            notice = f"Enabled {plugin_name}."
 
         self.refresh_plugins_list()
         self.notify_user(notice, level='success')
@@ -1491,7 +1504,8 @@ class SugoiHookGUI:
                 # A replacement keeps the same filename; remove its active
                 # marker so the new instance is enabled below.
                 if dest_path.name in self.active_plugins:
-                    self.deactivate_plugin(dest_path.name)
+                    if not self.deactivate_plugin(dest_path.name):
+                        return
 
                 # Load the new plugin
                 plugin = self.load_plugin(dest_path)
@@ -1564,10 +1578,16 @@ class SugoiHookGUI:
                         plugin_path.unlink()
                     
                     # Save the updated configuration
-                    self.save_plugins_config()
+                    config_saved = self.save_plugins_config()
                     
                     self.refresh_plugins_list()
-                    self.notify_user(f"Plugin '{plugin_name}' removed.", level='success')
+                    if config_saved:
+                        self.notify_user(f"Plugin '{plugin_name}' removed.", level='success')
+                    else:
+                        self.notify_user(
+                            f"Plugin '{plugin_name}' was removed, but its configuration could not be updated.",
+                            level='warning',
+                        )
                     
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to remove plugin:\n{str(e)}")
@@ -2005,10 +2025,10 @@ class SugoiHookGUI:
 
         def save_settings():
             collect_current_draft_values()
-            accepted_values = self.apply_plugin_settings(plugin_filename, plugin, draft_values)
-
-            if not self.save_plugins_config():
-                self.notify_user("Could not save plugin settings. See the runtime log for details.", level='warning')
+            saved, accepted_values = self.save_plugin_settings_transactionally(
+                plugin_filename, plugin, draft_values
+            )
+            if not saved:
                 return
             self.update_hook_status_panel()
             self.update_hook_action_state()
@@ -2054,6 +2074,46 @@ class SugoiHookGUI:
             if not persisted_values:
                 self.plugin_settings.pop(plugin_filename, None)
         return accepted_values
+
+    def save_plugin_settings_transactionally(self, plugin_filename, plugin, draft_values, require_all=False):
+        """Apply settings and roll runtime state back if persistence fails."""
+        previous_persisted_exists = plugin_filename in self.plugin_settings
+        previous_persisted = copy.deepcopy(self.plugin_settings.get(plugin_filename, {}))
+        current_settings = plugin.get_settings()
+        previous_runtime = {
+            setting_name: setting_spec[0]
+            for setting_name, setting_spec in current_settings.items()
+            if setting_name in draft_values and setting_spec
+        }
+
+        accepted_values = self.apply_plugin_settings(plugin_filename, plugin, draft_values)
+        should_rollback = require_all and len(accepted_values) != len(draft_values)
+        if not should_rollback and self.save_plugins_config():
+            return True, accepted_values
+
+        with self.output_processing_lock:
+            for setting_name, old_value in previous_runtime.items():
+                if setting_name in accepted_values:
+                    try:
+                        plugin.set_setting(setting_name, old_value)
+                    except Exception:
+                        logging.exception("Plugin %s failed to roll back setting %s", plugin_filename, setting_name)
+            if previous_persisted_exists:
+                self.plugin_settings[plugin_filename] = previous_persisted
+            else:
+                self.plugin_settings.pop(plugin_filename, None)
+        if should_rollback:
+            self.notify_user("One or more plugin settings were rejected; no changes were saved.", level='warning')
+        return False, accepted_values
+
+    def commit_game_profiles(self, updated_profiles):
+        """Persist a complete profile snapshot, retaining old state on failure."""
+        previous_profiles = self.game_profiles
+        self.game_profiles = updated_profiles
+        if self.save_game_profiles():
+            return True
+        self.game_profiles = previous_profiles
+        return False
 
     # ==================== END PLUGIN SYSTEM METHODS =============    
     # ==================== GAME PROFILES SYSTEM METHODS =============    
@@ -2139,7 +2199,8 @@ class SugoiHookGUI:
                 return
             
             # Create or update profile
-            self.game_profiles[self.current_game_id] = {
+            updated_profiles = dict(self.game_profiles)
+            updated_profiles[self.current_game_id] = {
                 'exe_name': exe_name,
                 'exe_path': exe_path,
                 'exe_size': exe_size,
@@ -2153,13 +2214,14 @@ class SugoiHookGUI:
             }
             
             # Save to file
-            self.save_game_profiles()
+            if not self.commit_game_profiles(updated_profiles):
+                return
             
             # Show brief notification
             self.append_event(f"💾 Hook profile saved for {exe_name}\n")
             
         except Exception:
-            pass
+            logging.exception("Failed to save hook profile")
     
     def check_and_load_hook_profile(self):
         """Check if game profile exists and prepare auto-hook"""
@@ -2358,7 +2420,7 @@ class SugoiHookGUI:
         
         try:
             # Launch the executable
-            subprocess.Popen([str(exe_path)], shell=True)
+            self.launch_executable(exe_path)
             
             # Show notification in output
             self.append_event(f"🚀 Launching: {exe_path.name}\n")
@@ -2425,6 +2487,10 @@ class SugoiHookGUI:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to launch executable:\n{str(e)}")
+
+    def launch_executable(self, exe_path):
+        """Launch a selected executable directly without invoking a shell."""
+        return subprocess.Popen([str(exe_path)])
     
     def open_profile_manager(self):
         """Open game profile management window"""
@@ -2531,8 +2597,10 @@ class SugoiHookGUI:
             )
             
             if result:
-                del self.game_profiles[game_id]
-                self.save_game_profiles()
+                updated_profiles = dict(self.game_profiles)
+                del updated_profiles[game_id]
+                if not self.commit_game_profiles(updated_profiles):
+                    return
                 profiles_tree.delete(selection[0])
                 # Update title count
                 for widget in title_frame.winfo_children():
@@ -2570,7 +2638,7 @@ class SugoiHookGUI:
                 manager.destroy()
                 
                 # Launch the game
-                subprocess.Popen([exe_path], shell=True)
+                self.launch_executable(exe_path)
                 
                 # Show notification in output
                 self.append_event(f"🚀 Launching game: {game_name}\n")
@@ -2653,8 +2721,8 @@ class SugoiHookGUI:
             )
             
             if result:
-                self.game_profiles = {}
-                self.save_game_profiles()
+                if not self.commit_game_profiles({}):
+                    return
                 profiles_tree.delete(*profiles_tree.get_children())
                 # Update title count
                 for widget in title_frame.winfo_children():
@@ -3477,11 +3545,14 @@ class SugoiHookGUI:
                         new_order.append(filename)
                 
                 # Update stored order
+                previous_order = self.plugin_order
                 self.plugin_order = new_order
-                self.save_plugins_config()
+                if not self.save_plugins_config():
+                    self.plugin_order = previous_order
+                    self.refresh_plugins_list()
                 
             except Exception:
-                pass
+                logging.exception("Failed to reorder plugins by drag and drop")
                 
         self.drag_start_item = None
     
@@ -4435,42 +4506,43 @@ For more information, refer to the Luna Hook documentation and current community
             return
 
         plugin = self.plugins[plugin_filename]
-        if plugin_filename not in self.active_plugins:
-            self.activate_plugin(plugin_filename)
-
         current_dialogue = str(plugin._state.get('dialogue_hook_id', '')).strip()
         current_prefixes = [part.strip() for part in str(plugin._state.get('prefix_hook_ids', '')).split(',') if part.strip()]
 
         if role == 'dialogue':
             updated_prefixes = self.filter_hook_concat_selectors(current_prefixes, hook_id)
-            if not plugin.set_setting('dialogue_hook_id', selector_value):
-                self.notify_user("Failed to set dialogue hook.", level='warning')
-                return
-            if not plugin.set_setting('prefix_hook_ids', ','.join(updated_prefixes)):
-                self.notify_user("Failed to update prefix hooks.", level='warning')
-                return
+            draft_values = {
+                'dialogue_hook_id': selector_value,
+                'prefix_hook_ids': ','.join(updated_prefixes),
+                'enabled_mode': True,
+            }
             role_label = 'dialogue hook'
         elif role == 'prefix':
             if self.resolve_hook_concat_selector(current_dialogue) == str(hook_id):
                 self.notify_user("That hook is already assigned as the dialogue hook.", level='warning')
                 return
-            if not plugin.set_setting('prefix_hook_ids', selector_value):
-                self.notify_user("Failed to set prefix hook.", level='warning')
-                return
+            draft_values = {
+                'prefix_hook_ids': selector_value,
+                'enabled_mode': True,
+            }
             role_label = 'prefix hook'
         else:
             return
 
-        if not plugin.set_setting('enabled_mode', True):
-            self.notify_user("Failed to enable hook concatenation mode.", level='warning')
+        activated_for_change = plugin_filename not in self.active_plugins
+        if activated_for_change and not self.activate_plugin(plugin_filename):
             return
 
-        if plugin_filename not in self.plugin_settings:
-            self.plugin_settings[plugin_filename] = {}
-        self.plugin_settings[plugin_filename]['dialogue_hook_id'] = str(plugin._state.get('dialogue_hook_id', '')).strip()
-        self.plugin_settings[plugin_filename]['prefix_hook_ids'] = str(plugin._state.get('prefix_hook_ids', '')).strip()
-        self.plugin_settings[plugin_filename]['enabled_mode'] = bool(plugin._state.get('enabled_mode', False))
-        self.save_plugins_config()
+        saved, _ = self.save_plugin_settings_transactionally(
+            plugin_filename,
+            plugin,
+            draft_values,
+            require_all=True,
+        )
+        if not saved:
+            if activated_for_change:
+                self.deactivate_plugin(plugin_filename)
+            return
         self.update_hook_status_panel(f"set concat {role_label}")
         self.notify_user(f"Set {selector_value} as {role_label}.", level='success')
     
