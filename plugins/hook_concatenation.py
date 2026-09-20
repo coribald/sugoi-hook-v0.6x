@@ -47,7 +47,7 @@ class HookConcatenationPlugin(HookPlugin):
             pass
     name = "Hook Concatenation"
     description = "Concatenate output from multiple hooks with optional delayed prefixes"
-    version = "1.2"
+    version = "1.4"
     author = "Sugoi Hook"
 
     def _log_resolved_config(self, reason: str):
@@ -64,6 +64,7 @@ class HookConcatenationPlugin(HookPlugin):
             prefix_hook_ids=config.get('prefix_hook_ids', []),
             all_hook_ids=config.get('all_hook_ids', []),
             speaker_wait_ms=config.get('speaker_wait_ms', 150),
+            dialogue_continuation_window_ms=self._state.get('dialogue_continuation_window_ms', 450),
             clipboard_output_mode=self._state.get('clipboard_output_mode', 'combined'),
         )
 
@@ -75,6 +76,7 @@ class HookConcatenationPlugin(HookPlugin):
         self._state['dialogue_hook_id'] = ""
         self._state['prefix_hook_ids'] = ""
         self._state['speaker_wait_ms'] = 150
+        self._state['dialogue_continuation_window_ms'] = 450
         self._state['clipboard_output_mode'] = 'combined'
         self._state['max_dialogue_length'] = 400
         self._state['burst_stabilization_enabled'] = True
@@ -85,12 +87,18 @@ class HookConcatenationPlugin(HookPlugin):
         self._state['pending_dialogue'] = None
         self._state['pending_timer_id'] = None
         self._state['pending_clipboard_emit'] = None
+        self._state['pending_prefix_started_at'] = 0.0
+        self._state['pending_dialogue_started_at'] = 0.0
+        self._state['pending_dialogue_updated_at'] = 0.0
+        self._state['pending_prefix_values'] = {}
+        self._state['pending_dialogue_continuation'] = None
+        self._state['pending_dialogue_continuation_at'] = 0.0
         self._state['recent_hook_times'] = deque()
         self._state['burst_suppression_active'] = False
         self._state['burst_release_timer_id'] = None
         self._state['post_burst_recovery_active'] = False
         self._state['recovery_prefix_hook_ids'] = set()
-        self._hook_pattern = re.compile(r'^\[Hook #?(\d+)\]\s*(.*)$', re.IGNORECASE)
+        self._hook_pattern = re.compile(r'^\[Hook #?(\d+)(?:\|(\d+))?\]\s*(.*)$', re.IGNORECASE)
 
     def process_text(self, text: str) -> Optional[str]:
         if not self._state['enabled_mode']:
@@ -116,7 +124,11 @@ class HookConcatenationPlugin(HookPlugin):
             return text
 
         hook_id = match.group(1)
-        hook_text = match.group(2).strip()
+        event_sequence = int(match.group(2) or 0)
+        hook_text = match.group(3).strip()
+        app = getattr(self, 'app', None)
+        if event_sequence and app and hasattr(app, 'mark_hook_event_processed'):
+            app.mark_hook_event_processed(hook_id, event_sequence)
 
         if hook_id not in config['all_hook_ids']:
             self._log_debug('drop_unconfigured_hook', hook_id=hook_id, text=hook_text)
@@ -128,34 +140,80 @@ class HookConcatenationPlugin(HookPlugin):
         if self._handle_post_burst_recovery(config, hook_id, hook_text):
             return None
 
+        if hook_id == config['dialogue_hook_id'] and self._maybe_append_dialogue_continuation(config, hook_text):
+            return None
+
         if hook_id in self._state['hook_buffers'] and hook_id == config['dialogue_hook_id']:
             self._flush_pending_dialogue()
             self._state['hook_buffers'] = {}
 
-        if hook_text:
-            self._state['hook_buffers'][hook_id] = hook_text
-
         if hook_id in config['prefix_hook_ids']:
             self._log_debug('prefix_received', hook_id=hook_id, text=hook_text, pending_dialogue=self._state.get('pending_dialogue'))
             if self._state['pending_dialogue']:
-                if self._all_prefixes_ready(config):
-                    self._cancel_pending_timer()
-                    self._log_debug('emit_on_prefix_ready', hook_id=hook_id)
-                    return self._emit_pending_dialogue_now()
-                self._log_debug('prefix_waiting_for_more', hook_id=hook_id, configured_prefixes=config['prefix_hook_ids'], buffered=list(self._state['hook_buffers'].keys()))
-                return None
+                now = time.monotonic()
+                pending_prefix_values = self._state.get('pending_prefix_values', {})
+                pending_prefix = str(pending_prefix_values.get(hook_id, '')).strip()
+                pending_continuation = (self._state.get('pending_dialogue_continuation') or '').strip()
+                continuation_at = float(self._state.get('pending_dialogue_continuation_at') or now)
+                if not pending_prefix or pending_prefix == hook_text:
+                    continuation_resolved = self._consume_pending_dialogue_continuation(config)
+                    if hook_text:
+                        self._state['hook_buffers'][hook_id] = hook_text
+                        pending_prefix_values[hook_id] = hook_text
+                    self._state['pending_prefix_values'] = pending_prefix_values
+                    if not continuation_resolved:
+                        self._state['pending_dialogue_updated_at'] = now
+                    wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+                    self._log_debug('hold_same_speaker_continuation', hook_id=hook_id, text=hook_text, wait_ms=wait_ms)
+                    self._schedule_pending_emit(wait_ms)
+                    return None
 
+                self._log_debug('speaker_changed_flush_pending', hook_id=hook_id, previous=pending_prefix, incoming=hook_text)
+                self._state['pending_dialogue_continuation'] = None
+                self._state['pending_dialogue_continuation_at'] = 0.0
+                output_text = self._emit_pending_dialogue_now()
+                if hook_text:
+                    self._state['hook_buffers'][hook_id] = hook_text
+                if pending_continuation:
+                    self._state['pending_dialogue'] = pending_continuation
+                    self._state['pending_dialogue_started_at'] = continuation_at
+                    self._state['pending_dialogue_updated_at'] = continuation_at
+                    self._state['hook_buffers'][config['dialogue_hook_id']] = pending_continuation
+                    self._state['pending_prefix_values'] = {hook_id: hook_text} if hook_text else {}
+                    wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+                    self._schedule_pending_emit(wait_ms)
+                else:
+                    wait_ms = max(0, int(config['speaker_wait_ms']))
+                    self._state['pending_prefix_started_at'] = now
+                    self._schedule_pending_emit(wait_ms)
+                return output_text
+
+            if hook_text:
+                self._state['hook_buffers'][hook_id] = hook_text
             wait_ms = max(0, int(config['speaker_wait_ms']))
             if wait_ms == 0:
                 self._log_debug('emit_prefix_no_wait', hook_id=hook_id)
                 return self._emit_pending_dialogue_now()
 
             self._log_debug('schedule_prefix_only_emit', hook_id=hook_id, wait_ms=wait_ms, buffered=list(self._state['hook_buffers'].keys()))
+            self._state['pending_prefix_started_at'] = time.monotonic()
             self._schedule_pending_emit(wait_ms)
             return None
 
+        if hook_text:
+            self._state['hook_buffers'][hook_id] = hook_text
+
         if hook_id == config['dialogue_hook_id']:
+            now = time.monotonic()
             self._state['pending_dialogue'] = hook_text
+            self._state['pending_prefix_started_at'] = 0.0
+            self._state['pending_dialogue_started_at'] = now
+            self._state['pending_dialogue_updated_at'] = now
+            self._state['pending_prefix_values'] = {
+                prefix_hook_id: self._state['hook_buffers'][prefix_hook_id]
+                for prefix_hook_id in config['prefix_hook_ids']
+                if (self._state['hook_buffers'].get(prefix_hook_id) or '').strip()
+            }
             self._log_debug('dialogue_received', hook_id=hook_id, text=hook_text, buffered=list(self._state['hook_buffers'].keys()))
             if not hook_text:
                 self._log_debug('drop_empty_dialogue', hook_id=hook_id)
@@ -174,20 +232,36 @@ class HookConcatenationPlugin(HookPlugin):
                 return None
 
             if not config['prefix_hook_ids']:
-                self._log_debug('emit_dialogue_without_prefixes', hook_id=hook_id)
-                return self._emit_pending_dialogue_now()
+                wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+                if wait_ms <= 0:
+                    self._log_debug('emit_dialogue_without_prefixes', hook_id=hook_id)
+                    return self._emit_pending_dialogue_now()
+                self._log_debug('schedule_dialogue_continuation_wait', hook_id=hook_id, wait_ms=wait_ms)
+                self._schedule_pending_emit(wait_ms)
+                return None
 
             if self._all_prefixes_ready(config):
-                self._log_debug('emit_dialogue_with_ready_prefixes', hook_id=hook_id)
-                return self._emit_pending_dialogue_now()
+                wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+                if wait_ms <= 0:
+                    self._log_debug('emit_dialogue_with_ready_prefixes', hook_id=hook_id)
+                    return self._emit_pending_dialogue_now()
+                self._log_debug('schedule_ready_dialogue_continuation_wait', hook_id=hook_id, wait_ms=wait_ms)
+                self._schedule_pending_emit(wait_ms)
+                return None
 
             wait_ms = max(0, int(config['speaker_wait_ms']))
             if wait_ms == 0:
-                self._log_debug('emit_dialogue_no_wait', hook_id=hook_id)
-                return self._emit_pending_dialogue_now()
+                continuation_wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+                if continuation_wait_ms <= 0:
+                    self._log_debug('emit_dialogue_no_wait', hook_id=hook_id)
+                    return self._emit_pending_dialogue_now()
+                self._log_debug('schedule_dialogue_continuation_only', hook_id=hook_id, wait_ms=continuation_wait_ms)
+                self._schedule_pending_emit(continuation_wait_ms)
+                return None
 
-            self._log_debug('schedule_pending_emit', hook_id=hook_id, wait_ms=wait_ms, expected_prefixes=config['prefix_hook_ids'])
-            self._schedule_pending_emit(wait_ms)
+            combined_wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+            self._log_debug('schedule_pending_emit', hook_id=hook_id, wait_ms=combined_wait_ms, expected_prefixes=config['prefix_hook_ids'])
+            self._schedule_pending_emit(combined_wait_ms)
             return None
 
         return None
@@ -222,7 +296,7 @@ class HookConcatenationPlugin(HookPlugin):
             return text
 
         hook_id = match.group(1)
-        hook_text = match.group(2).strip()
+        hook_text = match.group(3).strip()
 
         if hook_id not in config['all_hook_ids']:
             self._log_debug('clipboard_drop_unconfigured_hook', hook_id=hook_id, text=hook_text)
@@ -281,7 +355,10 @@ class HookConcatenationPlugin(HookPlugin):
             return normalized_selector
 
         app = getattr(self, 'app', None)
-        hooks = getattr(app, 'hooks', {}) if app else {}
+        if app and hasattr(app, 'get_hooks_snapshot'):
+            hooks = app.get_hooks_snapshot()
+        else:
+            hooks = getattr(app, 'hooks', {}) if app else {}
         for hook_id, hook_info in hooks.items():
             context_info = str(hook_info.get('context_info', '')).strip()
             function_name = str(hook_info.get('function', '')).strip()
@@ -314,6 +391,7 @@ class HookConcatenationPlugin(HookPlugin):
         return ''.join(output_parts)
 
     def _build_pending_clipboard_output(self) -> Optional[str]:
+        self._maybe_recover_pending_dialogue_from_hook_state()
         config = self._get_concat_config()
         dialogue_text = (self._state.get('pending_dialogue') or '').strip()
         if not dialogue_text:
@@ -346,6 +424,7 @@ class HookConcatenationPlugin(HookPlugin):
         return stripped
 
     def _build_pending_output(self) -> str:
+        self._maybe_recover_pending_dialogue_from_hook_state()
         config = self._get_concat_config()
         output_parts = []
         for prefix_hook_id in config['prefix_hook_ids']:
@@ -359,12 +438,153 @@ class HookConcatenationPlugin(HookPlugin):
             return ""
         return ''.join(output_parts) + '\n'
 
+    def _get_dialogue_continuation_window_ms(self) -> int:
+        return max(0, int(self._state.get('dialogue_continuation_window_ms', 450)))
+
+    def _compute_pending_dialogue_emit_wait_ms(self, config, now: Optional[float] = None) -> int:
+        now = time.monotonic() if now is None else now
+        wait_ms = 0
+
+        pending_dialogue = (self._state.get('pending_dialogue') or '').strip()
+        if not pending_dialogue:
+            return 0
+
+        continuation_window_ms = self._get_dialogue_continuation_window_ms()
+        if continuation_window_ms > 0:
+            updated_at = float(self._state.get('pending_dialogue_updated_at') or 0.0)
+            if updated_at > 0.0:
+                continuation_elapsed_ms = max(0.0, (now - updated_at) * 1000.0)
+                wait_ms = max(wait_ms, max(0, int(round(continuation_window_ms - continuation_elapsed_ms))))
+
+        if config.get('prefix_hook_ids') and not self._all_prefixes_ready(config):
+            speaker_wait_ms = max(0, int(config.get('speaker_wait_ms', 150)))
+            started_at = float(self._state.get('pending_dialogue_started_at') or 0.0)
+            if started_at > 0.0:
+                prefix_elapsed_ms = max(0.0, (now - started_at) * 1000.0)
+                wait_ms = max(wait_ms, max(0, int(round(speaker_wait_ms - prefix_elapsed_ms))))
+            else:
+                wait_ms = max(wait_ms, speaker_wait_ms)
+
+        return wait_ms
+
+    def _consume_pending_dialogue_continuation(self, config) -> bool:
+        continuation = (self._state.get('pending_dialogue_continuation') or '').strip()
+        if not continuation:
+            return False
+        pending_dialogue = (self._state.get('pending_dialogue') or '').strip()
+        continuation_at = float(self._state.get('pending_dialogue_continuation_at') or time.monotonic())
+        self._state['pending_dialogue_continuation'] = None
+        self._state['pending_dialogue_continuation_at'] = 0.0
+        combined_dialogue = pending_dialogue + continuation
+        max_dialogue_length = max(200, int(self._state.get('max_dialogue_length', 400)))
+        if not pending_dialogue or len(combined_dialogue) > max_dialogue_length:
+            return False
+        self._state['pending_dialogue'] = combined_dialogue
+        self._state['pending_dialogue_updated_at'] = continuation_at
+        self._state['hook_buffers'][config['dialogue_hook_id']] = combined_dialogue
+        self._log_debug('append_speaker_resolved_continuation', incoming=continuation, combined=combined_dialogue)
+        return True
+
+    def _resolve_pending_dialogue_continuation(self):
+        config = self._get_concat_config()
+        if not self._consume_pending_dialogue_continuation(config):
+            return
+        now = time.monotonic()
+        wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+        if wait_ms <= 0:
+            self._flush_pending_dialogue()
+            return
+        self._schedule_pending_emit(wait_ms)
+
+    def _maybe_append_dialogue_continuation(self, config, hook_text: str) -> bool:
+        pending_dialogue = (self._state.get('pending_dialogue') or '').strip()
+        if not pending_dialogue:
+            return False
+
+        continuation_window_ms = self._get_dialogue_continuation_window_ms()
+        if continuation_window_ms <= 0:
+            return False
+
+        pending_prefix_values = self._state.get('pending_prefix_values', {})
+        for prefix_hook_id, pending_prefix in pending_prefix_values.items():
+            current_prefix = str(self._state['hook_buffers'].get(prefix_hook_id, '')).strip()
+            if current_prefix and current_prefix != str(pending_prefix).strip():
+                self._log_debug('skip_dialogue_continuation_speaker_changed', hook_id=prefix_hook_id, previous=pending_prefix, current=current_prefix)
+                return False
+
+        now = time.monotonic()
+        updated_at = float(self._state.get('pending_dialogue_updated_at') or 0.0)
+        if updated_at <= 0.0:
+            return False
+
+        elapsed_ms = (now - updated_at) * 1000.0
+        if elapsed_ms > continuation_window_ms:
+            self._log_debug(
+                'dialogue_continuation_window_expired',
+                elapsed_ms=round(elapsed_ms, 1),
+                continuation_window_ms=continuation_window_ms,
+            )
+            return False
+
+        pending_continuation = (self._state.get('pending_dialogue_continuation') or '').strip()
+        max_dialogue_length = max(200, int(self._state.get('max_dialogue_length', 400)))
+        if pending_prefix_values:
+            held_continuation = pending_continuation + hook_text
+            if len(pending_dialogue + held_continuation) > max_dialogue_length:
+                if pending_continuation:
+                    self._consume_pending_dialogue_continuation(config)
+                return False
+            self._state['pending_dialogue_continuation'] = held_continuation
+            self._state['pending_dialogue_continuation_at'] = now
+            remaining_ms = max(0, int(round(continuation_window_ms - elapsed_ms)))
+            speaker_resolution_ms = min(max(0, int(config.get('speaker_wait_ms', 150))), remaining_ms)
+            self._log_debug(
+                'hold_dialogue_for_speaker_resolution',
+                incoming=hook_text,
+                held=held_continuation,
+                wait_ms=speaker_resolution_ms,
+            )
+            self._schedule_pending_callback(speaker_resolution_ms, self._resolve_pending_dialogue_continuation)
+            return True
+
+        combined_dialogue = pending_dialogue + hook_text
+        if len(combined_dialogue) > max_dialogue_length:
+            self._log_debug(
+                'drop_dialogue_continuation_oversized',
+                length=len(combined_dialogue),
+                max_dialogue_length=max_dialogue_length,
+                existing=pending_dialogue,
+                incoming=hook_text,
+            )
+            return False
+
+        self._state['pending_dialogue'] = combined_dialogue
+        self._state['pending_dialogue_updated_at'] = now
+        self._state['hook_buffers'][config['dialogue_hook_id']] = combined_dialogue
+
+        wait_ms = self._compute_pending_dialogue_emit_wait_ms(config, now)
+        self._log_debug(
+            'append_dialogue_continuation',
+            incoming=hook_text,
+            combined=combined_dialogue,
+            elapsed_ms=round(elapsed_ms, 1),
+            wait_ms=wait_ms,
+        )
+        self._schedule_pending_emit(wait_ms)
+        return True
+
     def _emit_pending_dialogue_now(self) -> Optional[str]:
         self._cancel_pending_timer()
         output_text = self._build_pending_output()
         clipboard_output = self._build_pending_clipboard_output()
         self._log_debug('emit_pending_dialogue', output=output_text, buffered=list(self._state['hook_buffers'].keys()))
         self._state['pending_dialogue'] = None
+        self._state['pending_prefix_started_at'] = 0.0
+        self._state['pending_dialogue_started_at'] = 0.0
+        self._state['pending_dialogue_updated_at'] = 0.0
+        self._state['pending_prefix_values'] = {}
+        self._state['pending_dialogue_continuation'] = None
+        self._state['pending_dialogue_continuation_at'] = 0.0
         self._state['hook_buffers'] = {}
         if output_text:
             self._state['pending_clipboard_emit'] = clipboard_output
@@ -372,8 +592,34 @@ class HookConcatenationPlugin(HookPlugin):
             self._state['pending_clipboard_emit'] = None
         return output_text or None
 
+    def _submitted_dialogue_is_waiting_in_pipeline(self) -> bool:
+        if self._state.get('pending_dialogue'):
+            return False
+        if float(self._state.get('pending_prefix_started_at') or 0.0) <= 0.0:
+            return False
+        config = self._get_concat_config()
+        dialogue_hook_id = str(config.get('dialogue_hook_id') or '').strip()
+        app = getattr(self, 'app', None)
+        if not dialogue_hook_id or not app or not hasattr(app, 'get_hooks_snapshot'):
+            return False
+        hook_info = app.get_hooks_snapshot().get(dialogue_hook_id)
+        if not isinstance(hook_info, dict):
+            return False
+        latest_event_sequence = int(hook_info.get('latest_event_sequence') or 0)
+        last_pipeline_sequence = int(hook_info.get('last_pipeline_sequence') or 0)
+        last_processed_sequence = int(hook_info.get('last_processed_sequence') or 0)
+        return (
+            latest_event_sequence > 0 and
+            latest_event_sequence <= last_pipeline_sequence and
+            latest_event_sequence > last_processed_sequence
+        )
+
     def _flush_pending_dialogue(self):
         self._log_debug('flush_pending_dialogue')
+        if self._submitted_dialogue_is_waiting_in_pipeline():
+            self._log_debug('defer_flush_for_submitted_dialogue')
+            self._schedule_pending_emit(10)
+            return
         output_text = self._emit_pending_dialogue_now()
         if not output_text:
             return
@@ -381,23 +627,26 @@ class HookConcatenationPlugin(HookPlugin):
         if not app:
             return
         try:
-            app.run_on_ui_thread(app.append_output, output_text, True, False)
+            app.submit_output_processing(output_text, True, front=True)
         except Exception:
             pass
 
-    def _schedule_pending_emit(self, wait_ms: int):
+    def _schedule_pending_callback(self, wait_ms: int, callback):
         self._cancel_pending_timer()
         app = getattr(self, 'app', None)
-        if not app or not hasattr(app, 'root'):
+        if not app or not hasattr(app, 'schedule_pipeline_callback'):
             return
-        self._state['pending_timer_id'] = app.root.after(wait_ms, self._flush_pending_dialogue)
+        self._state['pending_timer_id'] = app.schedule_pipeline_callback(wait_ms, callback)
+
+    def _schedule_pending_emit(self, wait_ms: int):
+        self._schedule_pending_callback(wait_ms, self._flush_pending_dialogue)
 
     def _cancel_pending_timer(self):
         timer_id = self._state.get('pending_timer_id')
         app = getattr(self, 'app', None)
-        if timer_id and app and hasattr(app, 'root'):
+        if timer_id and app and hasattr(app, 'cancel_pipeline_callback'):
             try:
-                app.root.after_cancel(timer_id)
+                app.cancel_pipeline_callback(timer_id)
             except Exception:
                 pass
         self._state['pending_timer_id'] = None
@@ -483,15 +732,21 @@ class HookConcatenationPlugin(HookPlugin):
                 recovery_prefix_ids = set(self._state.get('recovery_prefix_hook_ids') or set())
                 required_prefix_ids = set(config['prefix_hook_ids'])
                 if not required_prefix_ids.issubset(recovery_prefix_ids):
-                    self._log_debug(
-                        'recovery_wait_for_prefix_pair',
-                        hook_id=hook_id,
-                        text=hook_text,
-                        ready_prefixes=sorted(recovery_prefix_ids),
-                        required_prefixes=sorted(required_prefix_ids),
-                    )
-                    self._discard_pending_concat_state()
-                    return True
+                    looks_spoken = any(marker in hook_text for marker in ('「', '」', '『', '』', '"', '“', '”'))
+                    if looks_spoken:
+                        self._log_debug(
+                            'recovery_wait_for_prefix_pair',
+                            hook_id=hook_id,
+                            text=hook_text,
+                            ready_prefixes=sorted(recovery_prefix_ids),
+                            required_prefixes=sorted(required_prefix_ids),
+                        )
+                        self._discard_pending_concat_state()
+                        return True
+                    self._state['post_burst_recovery_active'] = False
+                    self._state['recovery_prefix_hook_ids'] = set()
+                    self._log_debug('recovery_complete_narration', hook_id=hook_id, text=hook_text)
+                    return False
 
             self._state['post_burst_recovery_active'] = False
             self._state['recovery_prefix_hook_ids'] = set()
@@ -534,16 +789,16 @@ class HookConcatenationPlugin(HookPlugin):
     def _schedule_burst_release(self, wait_ms: int):
         self._cancel_burst_release_timer()
         app = getattr(self, 'app', None)
-        if not app or not hasattr(app, 'root'):
+        if not app or not hasattr(app, 'schedule_pipeline_callback'):
             return
-        self._state['burst_release_timer_id'] = app.root.after(wait_ms, self._release_burst_suppression)
+        self._state['burst_release_timer_id'] = app.schedule_pipeline_callback(wait_ms, self._release_burst_suppression)
 
     def _cancel_burst_release_timer(self):
         timer_id = self._state.get('burst_release_timer_id')
         app = getattr(self, 'app', None)
-        if timer_id and app and hasattr(app, 'root'):
+        if timer_id and app and hasattr(app, 'cancel_pipeline_callback'):
             try:
-                app.root.after_cancel(timer_id)
+                app.cancel_pipeline_callback(timer_id)
             except Exception:
                 pass
         self._state['burst_release_timer_id'] = None
@@ -552,6 +807,72 @@ class HookConcatenationPlugin(HookPlugin):
         self._state['hook_buffers'] = {}
         self._state['pending_dialogue'] = None
         self._state['pending_clipboard_emit'] = None
+        self._state['pending_prefix_started_at'] = 0.0
+        self._state['pending_dialogue_started_at'] = 0.0
+        self._state['pending_dialogue_updated_at'] = 0.0
+        self._state['pending_prefix_values'] = {}
+        self._state['pending_dialogue_continuation'] = None
+        self._state['pending_dialogue_continuation_at'] = 0.0
+
+    def _maybe_recover_pending_dialogue_from_hook_state(self):
+        pending_dialogue = (self._state.get('pending_dialogue') or '').strip()
+        if pending_dialogue:
+            return
+
+        pending_prefix_started_at = float(self._state.get('pending_prefix_started_at') or 0.0)
+        if pending_prefix_started_at <= 0.0:
+            return
+
+        if not self._state.get('hook_buffers'):
+            return
+
+        config = self._get_concat_config()
+        dialogue_hook_id = str(config.get('dialogue_hook_id') or '').strip()
+        if not dialogue_hook_id:
+            return
+
+        app = getattr(self, 'app', None)
+        if app and hasattr(app, 'get_hooks_snapshot'):
+            hooks = app.get_hooks_snapshot()
+        else:
+            hooks = getattr(app, 'hooks', {}) if app else {}
+        hook_info = hooks.get(dialogue_hook_id)
+        if not isinstance(hook_info, dict):
+            return
+
+        latest_event_snapshot = hook_info.get('latest_event_snapshot')
+        if isinstance(latest_event_snapshot, (tuple, list)) and len(latest_event_snapshot) == 3:
+            latest_text = str(latest_event_snapshot[0] or '').strip()
+            last_seen_monotonic = float(latest_event_snapshot[1] or 0.0)
+            latest_event_sequence = int(latest_event_snapshot[2] or 0)
+        else:
+            latest_text = str(hook_info.get('latest_text') or '').strip()
+            last_seen_monotonic = float(hook_info.get('last_seen_monotonic') or 0.0)
+            latest_event_sequence = int(hook_info.get('latest_event_sequence') or 0)
+        last_pipeline_sequence = int(hook_info.get('last_pipeline_sequence') or 0)
+        if latest_event_sequence and latest_event_sequence <= last_pipeline_sequence:
+            self._log_debug(
+                'skip_recovery_for_submitted_dialogue',
+                hook_id=dialogue_hook_id,
+                latest_event_sequence=latest_event_sequence,
+                last_pipeline_sequence=last_pipeline_sequence,
+            )
+            return
+        if not latest_text or last_seen_monotonic <= pending_prefix_started_at:
+            return
+
+        now = time.monotonic()
+        if now - last_seen_monotonic > 1.5:
+            return
+
+        self._state['pending_dialogue'] = latest_text
+        self._log_debug(
+            'recovered_pending_dialogue_from_hook_state',
+            hook_id=dialogue_hook_id,
+            text=latest_text,
+            last_seen_monotonic=last_seen_monotonic,
+            pending_prefix_started_at=pending_prefix_started_at,
+        )
 
     def _release_burst_suppression(self):
         self._state['burst_release_timer_id'] = None
@@ -615,7 +936,13 @@ class HookConcatenationPlugin(HookPlugin):
                 self._state['speaker_wait_ms'],
                 'int_slider',
                 'How long to wait for optional prefix hooks before emitting dialogue only',
-                {'min': 0, 'max': 500}
+                {'min': 0, 'max': 1000}
+            ),
+            'dialogue_continuation_window_ms': (
+                self._state['dialogue_continuation_window_ms'],
+                'int_slider',
+                'How long to merge rapid dialogue chunks from the same speaker or narration hook before emitting',
+                {'min': 0, 'max': 2000}
             ),
             'clipboard_output_mode': (
                 self._state['clipboard_output_mode'],
@@ -689,8 +1016,20 @@ class HookConcatenationPlugin(HookPlugin):
         elif name == 'speaker_wait_ms':
             try:
                 wait_ms = int(value)
-                if 0 <= wait_ms <= 500:
+                if 0 <= wait_ms <= 1000:
                     self._state['speaker_wait_ms'] = wait_ms
+                    self.reset()
+                    self._log_resolved_config(f'set_setting:{name}')
+                    return True
+                return False
+            except (ValueError, TypeError):
+                return False
+
+        elif name == 'dialogue_continuation_window_ms':
+            try:
+                continuation_window_ms = int(value)
+                if 0 <= continuation_window_ms <= 2000:
+                    self._state['dialogue_continuation_window_ms'] = continuation_window_ms
                     self.reset()
                     self._log_resolved_config(f'set_setting:{name}')
                     return True

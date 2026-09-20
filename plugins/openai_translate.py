@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from collections import deque
 import requests
 from typing import Optional
@@ -90,6 +91,7 @@ class OpenAITranslatePlugin(HookPlugin):
         self.reasoning_effort = "minimal"
         self.verbosity = "low"
         self.timeout_seconds = 45
+        self.timeout_retry_count = 1
         self.max_output_tokens = 300
         self.previous_context_lines = 3
         self.recent_original_lines = deque(maxlen=6)
@@ -164,7 +166,9 @@ class OpenAITranslatePlugin(HookPlugin):
                 "effort": self.reasoning_effort
             }
 
-        for attempt in range(2):
+        total_attempts = max(1, int(self.timeout_retry_count) + 1)
+
+        for attempt in range(total_attempts):
             try:
                 if self.session is None:
                     self.on_enable()
@@ -173,7 +177,7 @@ class OpenAITranslatePlugin(HookPlugin):
                     self.log_debug("Recent original context:")
                     print(json.dumps(recent_context, ensure_ascii=False, indent=2), flush=True)
                 self.log_debug(
-                    f"Sending request. attempt={attempt + 1}/2, model={self.model}, input_len={len(text)}, "
+                    f"Sending request. attempt={attempt + 1}/{total_attempts}, model={self.model}, input_len={len(text)}, "
                     f"context_len={len(self.context_doc)}, recent_context_lines={len(recent_context)}, "
                     f"max_output_tokens={self.max_output_tokens}, "
                     f"reasoning_effort={self.reasoning_effort}, verbosity={effective_verbosity}",
@@ -214,11 +218,19 @@ class OpenAITranslatePlugin(HookPlugin):
                     response_text = "<unable to read response body>"
                 self.log_debug(f"HTTP error: {exc}. Body: {response_text}", level="minimal")
                 return None
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            except requests.exceptions.Timeout as exc:
                 error_type = type(exc).__name__
-                self.log_debug(f"{error_type} on attempt {attempt + 1}/2: {exc}", level="minimal")
-                if attempt == 0:
-                    self.log_debug("Resetting HTTP session and retrying once.", level="minimal")
+                self.log_debug(f"{error_type} on attempt {attempt + 1}/{total_attempts}: {exc}", level="minimal")
+                if attempt < total_attempts - 1:
+                    self.log_debug("Resetting HTTP session and retrying after timeout.", level="minimal")
+                    self.reset_session()
+                    continue
+                return None
+            except requests.exceptions.ConnectionError as exc:
+                error_type = type(exc).__name__
+                self.log_debug(f"{error_type} on attempt {attempt + 1}/{total_attempts}: {exc}", level="minimal")
+                if attempt < total_attempts - 1:
+                    self.log_debug("Resetting HTTP session and retrying after connection error.", level="minimal")
                     self.reset_session()
                     continue
                 return None
@@ -295,6 +307,9 @@ class OpenAITranslatePlugin(HookPlugin):
     def should_translate_text(self, stripped_text: str) -> bool:
         if not stripped_text:
             return False
+        if self.is_punctuation_only_text(stripped_text):
+            self.log_debug(f"Skipping punctuation-only text: {stripped_text}", level="minimal")
+            return False
         return not self.is_system_or_ui_text(stripped_text)
 
     def is_system_or_ui_text(self, stripped_text: str) -> bool:
@@ -323,6 +338,22 @@ class OpenAITranslatePlugin(HookPlugin):
                 return True
 
         return False
+
+    def is_punctuation_only_text(self, stripped_text: str) -> bool:
+        meaningful_char_found = False
+
+        for char in stripped_text:
+            if char.isspace():
+                continue
+
+            category = unicodedata.category(char)
+            if category.startswith('P') or category.startswith('S'):
+                meaningful_char_found = True
+                continue
+
+            return False
+
+        return meaningful_char_found
 
     def remember_original_line(self, text: str):
         stripped = text.strip()
@@ -450,6 +481,11 @@ class OpenAITranslatePlugin(HookPlugin):
                 "int",
                 "Request timeout (seconds)"
             ),
+            "timeout_retry_count": (
+                self.timeout_retry_count,
+                "int",
+                "How many times to retry after a timeout or connection error"
+            ),
             "max_output_tokens": (
                 self.max_output_tokens,
                 "int",
@@ -504,8 +540,18 @@ class OpenAITranslatePlugin(HookPlugin):
         if name == "timeout_seconds":
             try:
                 timeout = int(value)
-                if timeout >= 5:
+                if timeout >= 1:
                     self.timeout_seconds = timeout
+                    return True
+            except (TypeError, ValueError):
+                return False
+            return False
+
+        if name == "timeout_retry_count":
+            try:
+                retry_count = int(value)
+                if 0 <= retry_count <= 10:
+                    self.timeout_retry_count = retry_count
                     return True
             except (TypeError, ValueError):
                 return False

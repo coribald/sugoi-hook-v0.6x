@@ -448,17 +448,21 @@ class OverlayWindowPlugin(HookPlugin):
     def process_text(self, text: str) -> str:
         if not self.enabled:
             return text
-            
+
         is_translator_enabled = self._is_translation_plugin_enabled()
-        display_text = text
-        
-        if self.overlay:
-            if self.overlay.state() == 'withdrawn':
-                self.overlay.after(0, self.overlay.deiconify)
-            self.overlay.after(0, lambda t=display_text, e=is_translator_enabled: self.update_text(t, e))
-            self._debug("process_text", overlay_state=self.overlay.state(), text_len=len(display_text), translator_enabled=is_translator_enabled)
+        app = getattr(self, 'app', None)
+        if app and self.overlay:
+            app.run_on_ui_thread(self._display_processed_text, text, is_translator_enabled)
 
         return text
+
+    def _display_processed_text(self, text, is_translator_enabled):
+        if not self.overlay:
+            return
+        if self.overlay.state() == 'withdrawn':
+            self.overlay.deiconify()
+        self.update_text(text, is_translator_enabled)
+        self._debug("process_text", overlay_state=self.overlay.state(), text_len=len(text), translator_enabled=is_translator_enabled)
 
     def process_clipboard_text(self, text: str):
         return text

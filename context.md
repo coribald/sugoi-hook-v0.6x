@@ -36,10 +36,10 @@ Sugoi Hook is a Windows/Tkinter GUI for attaching to a running game process, sel
 - Process/hook/output flow is source-first during iteration. We are mostly running from the `.py` path, not rebuilding constantly.
 - The plugin pipeline now has a shared pre-translation stage so translator input and clipboard input can stay aligned.
 - The overlay window now has an optional native right-side dictionary pane backed by Jitendex.
-- Output processing is asynchronous and latest-wins:
-  - only one translation/output worker runs at a time
-  - new lines replace older pending work
-  - stale completed results are discarded instead of being appended late
+- Output processing is asynchronous with lossless stateful preprocessing and a latest-pending translation slot:
+  - every raw hook event reaches stateful plugins in arrival order
+  - only one translation request runs at a time, while newer pending lines replace older pending work
+  - an in-flight successful translation is still delivered before the newest pending line, while reset/detach-invalidated results are discarded
 - Hook Concatenation is stateful and timing-sensitive. It should be treated carefully because many downstream behaviors depend on its output.
 - Translation plugins are expected to receive the cleaned untranslated line, not raw hook text.
 - The app now logs a lot of pipeline detail to both `sugoihook-runtime.log` and the source-run console.

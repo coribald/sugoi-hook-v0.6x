@@ -17,7 +17,10 @@ import json
 import hashlib
 import logging
 import traceback
+from collections import deque
 from pathlib import Path
+
+from output_pipeline import OutputPipeline
 
 ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
@@ -252,6 +255,8 @@ class SugoiHookGUI:
         self.cli_process = None
         self.attached_pid = None
         self.hooks = {}
+        self.hooks_lock = threading.Lock()
+        self.hook_event_sequence = 0
         self.selected_hook_id = None
         self.is_reading = False
         self.process_icons = {}
@@ -292,22 +297,25 @@ class SugoiHookGUI:
         self.compact_window_geometry = None
         self.window_geometry_after_id = None
         self.pipeline_debug_enabled = runtime_debug_logging_enabled()
-        self.output_processing_lock = threading.Lock()
-        self.output_worker_condition = threading.Condition()
-        self.output_pending_request = None
-        self.output_request_generation = 0
-        self.output_latest_generation = 0
-        self.output_worker_shutdown = False
-        self.output_worker_thread = threading.Thread(
-            target=self.output_processing_worker,
-            name="output-processing-worker",
-            daemon=True,
+        self.output_processing_lock = threading.RLock()
+        self.ui_callback_lock = threading.Lock()
+        self.ui_callback_queue = deque()
+        self.ui_callback_shutdown = False
+        self.root.after(10, self.drain_ui_callbacks)
+        self.output_pipeline = OutputPipeline(
+            prepare=self.prepare_plugin_output_bundle,
+            complete=self.complete_plugin_output_bundle,
+            deliver=self.deliver_plugin_output_bundle,
+            is_latest_only=self.prepared_output_requires_translation,
+            on_error=self.handle_output_pipeline_error,
+            on_stale=self.handle_stale_output_bundle,
+            on_superseded=self.handle_superseded_output_bundle,
         )
-        self.output_worker_thread.start()
         
         # System tray
         self.tray_icon = None
         self.is_minimized_to_tray = False
+        self.shutdown_started = False
         
         # System directories to check for filtering
         self.system_dirs = [
@@ -434,8 +442,25 @@ class SugoiHookGUI:
         """Run a callback on the Tk UI thread."""
         if threading.current_thread() is threading.main_thread():
             callback(*args)
-        else:
-            self.root.after(0, lambda: callback(*args))
+            return
+        with self.ui_callback_lock:
+            if not self.ui_callback_shutdown:
+                self.ui_callback_queue.append((callback, args))
+
+    def drain_ui_callbacks(self):
+        """Run callbacks queued by background workers without calling Tk off-thread."""
+        callbacks = []
+        with self.ui_callback_lock:
+            while self.ui_callback_queue:
+                callbacks.append(self.ui_callback_queue.popleft())
+            shutdown = self.ui_callback_shutdown
+        for callback, args in callbacks:
+            try:
+                callback(*args)
+            except Exception:
+                logging.exception("UI callback failed")
+        if not shutdown:
+            self.root.after(10, self.drain_ui_callbacks)
 
     # ==================== PLUGIN SYSTEM METHODS =============    
     def init_plugin_system(self):
@@ -695,8 +720,37 @@ class SugoiHookGUI:
                 return filename
         return None
 
+    def get_hooks_snapshot(self):
+        with self.hooks_lock:
+            return {
+                str(hook_id): dict(hook_info)
+                for hook_id, hook_info in self.hooks.items()
+            }
+
+    def mark_hook_event_submitted(self, hook_id, event_sequence):
+        with self.hooks_lock:
+            hook_info = self.hooks.get(str(hook_id))
+            if hook_info is not None:
+                hook_info['last_pipeline_sequence'] = max(
+                    int(hook_info.get('last_pipeline_sequence') or 0),
+                    int(event_sequence),
+                )
+
+    def mark_hook_event_processed(self, hook_id, event_sequence):
+        with self.hooks_lock:
+            hook_info = self.hooks.get(str(hook_id))
+            if hook_info is not None:
+                hook_info['last_processed_sequence'] = max(
+                    int(hook_info.get('last_processed_sequence') or 0),
+                    int(event_sequence),
+                )
+
     def get_hook_concatenation_state(self):
         """Return whether hook concatenation mode is active and which hooks it is using."""
+        with self.output_processing_lock:
+            return self._get_hook_concatenation_state_unlocked()
+
+    def _get_hook_concatenation_state_unlocked(self):
         for plugin_filename, plugin in self.plugins.items():
             try:
                 if getattr(plugin, 'name', '') != 'Hook Concatenation':
@@ -885,25 +939,27 @@ class SugoiHookGUI:
     
     def activate_plugin(self, plugin_filename):
         """Activate a plugin"""
-        if plugin_filename in self.plugins and plugin_filename not in self.active_plugins:
-            self.active_plugins.append(plugin_filename)
-            plugin = self.plugins[plugin_filename]
-            plugin.enabled = True
-            plugin.on_enable()
-            self.save_plugins_config()
-            return True
+        with self.output_processing_lock:
+            if plugin_filename in self.plugins and plugin_filename not in self.active_plugins:
+                self.active_plugins.append(plugin_filename)
+                plugin = self.plugins[plugin_filename]
+                plugin.enabled = True
+                plugin.on_enable()
+                self.save_plugins_config()
+                return True
         return False
     
     def deactivate_plugin(self, plugin_filename):
         """Deactivate a plugin"""
-        if plugin_filename in self.active_plugins:
-            self.active_plugins.remove(plugin_filename)
-            if plugin_filename in self.plugins:
-                plugin = self.plugins[plugin_filename]
-                plugin.enabled = False
-                plugin.on_disable()
-            self.save_plugins_config()
-            return True
+        with self.output_processing_lock:
+            if plugin_filename in self.active_plugins:
+                self.active_plugins.remove(plugin_filename)
+                if plugin_filename in self.plugins:
+                    plugin = self.plugins[plugin_filename]
+                    plugin.enabled = False
+                    plugin.on_disable()
+                self.save_plugins_config()
+                return True
         return False
 
     def _pipeline_preview(self, value, limit=180):
@@ -1019,26 +1075,83 @@ class SugoiHookGUI:
         self.log_pipeline('pre_translation.complete', output=current_text, clipboard_output=clipboard_text, translation_plugins=[getattr(p, 'name', type(p).__name__) for p in translation_plugins], post_plugins=[getattr(p, 'name', type(p).__name__) for p in post_translation_plugins])
         return current_text, clipboard_text, translation_plugins, post_translation_plugins
 
-    def process_plugin_output_bundle(self, text):
-        """Build display and clipboard outputs from one shared plugin pass."""
-        if not PLUGINS_AVAILABLE:
-            stripped = text.strip() if isinstance(text, str) else text
-            return text, stripped
+    def is_translation_worthy_output(self, text):
+        stripped = text.strip() if isinstance(text, str) else text
+        if not stripped:
+            return False
+        if isinstance(stripped, str) and (
+            stripped.startswith('[Console]') or
+            stripped.startswith('[Hook ') or
+            stripped.startswith('[Hook #')
+        ):
+            return False
+        return True
 
-        current_text, clipboard_pre_translation, translation_plugins, post_translation_plugins = self.run_pre_translation_plugins(text)
+    def prepare_plugin_output_bundle(self, text, allow_auto_copy=False):
+        """Run every stateful pre-translation plugin in lossless arrival order."""
+        with self.output_processing_lock:
+            current_text, clipboard_pre_translation, translation_plugins, post_translation_plugins = self.run_pre_translation_plugins(text)
         if current_text is None:
             self.log_pipeline('bundle.dropped_pre_translation', incoming=text, clipboard_pre_translation=clipboard_pre_translation)
-            return None, None
+            return None
+
+        internal_marker_stripped = False
+        if isinstance(current_text, str):
+            internal_match = re.match(r'^\[Hook #?\d+\|\d+\]\s*(.*)$', current_text.strip(), re.DOTALL)
+            if internal_match:
+                current_text = internal_match.group(1) + ('\n' if current_text.endswith('\n') else '')
+                internal_marker_stripped = True
+        if isinstance(clipboard_pre_translation, str):
+            clipboard_match = re.match(r'^\[Hook #?\d+\|\d+\]\s*(.*)$', clipboard_pre_translation.strip(), re.DOTALL)
+            if clipboard_match:
+                clipboard_pre_translation = clipboard_match.group(1) + ('\n' if clipboard_pre_translation.endswith('\n') else '')
 
         translator_input = current_text.strip() if isinstance(current_text, str) else current_text
         clipboard_text = clipboard_pre_translation.strip() if isinstance(clipboard_pre_translation, str) else clipboard_pre_translation
-        self.log_pipeline('bundle.start', current_text=current_text, translator_input=translator_input, clipboard_pre_translation=clipboard_pre_translation, translation_plugin_count=len(translation_plugins), post_plugin_count=len(post_translation_plugins))
+        translation_candidates = []
+        if not internal_marker_stripped and self.is_translation_worthy_output(translator_input):
+            for plugin in translation_plugins:
+                should_translate = getattr(plugin, 'should_translate_text', None)
+                try:
+                    if callable(should_translate) and not should_translate(translator_input):
+                        continue
+                except Exception:
+                    logging.exception('Translation eligibility check failed: %s', getattr(plugin, 'name', type(plugin).__name__))
+                translation_candidates.append(plugin)
+        incoming_is_hook_preview = isinstance(text, str) and text.lstrip().startswith('[Hook')
+        output_is_hook_preview = isinstance(current_text, str) and current_text.lstrip().startswith('[Hook')
+        effective_auto_copy = allow_auto_copy or (
+            incoming_is_hook_preview and
+            not output_is_hook_preview and
+            not internal_marker_stripped
+        )
+        prepared = {
+            'incoming': text,
+            'current_text': current_text,
+            'translator_input': translator_input,
+            'clipboard_text': clipboard_text,
+            'translation_plugins': tuple(translation_candidates),
+            'post_translation_plugins': tuple(post_translation_plugins),
+            'allow_auto_copy': effective_auto_copy,
+        }
+        self.log_pipeline('bundle.prepared', incoming=text, translator_input=translator_input, clipboard_text=clipboard_text, allow_auto_copy=effective_auto_copy, translation_plugin_count=len(translation_candidates), post_plugin_count=len(post_translation_plugins))
+        return prepared
+
+    def prepared_output_requires_translation(self, prepared):
+        return bool(prepared['translation_plugins'])
+
+    def complete_plugin_output_bundle(self, prepared):
+        """Translate only the newest prepared logical line and run later plugins."""
+        current_text = prepared['current_text']
+        translator_input = prepared['translator_input']
+        clipboard_text = prepared['clipboard_text']
+        translation_plugins = prepared['translation_plugins']
+        post_translation_plugins = prepared['post_translation_plugins']
         display_text = current_text
 
         if translation_plugins:
             translation_results = []
             self.log_pipeline('translation.request', translator_input=translator_input, display_source=current_text, clipboard_source=clipboard_text, translation_plugins=[getattr(p, 'name', type(p).__name__) for p in translation_plugins])
-
             for plugin in translation_plugins:
                 try:
                     translated = plugin.translate_text(translator_input)
@@ -1048,44 +1161,17 @@ class SugoiHookGUI:
                     else:
                         self.log_pipeline('translation.empty', plugin=plugin.name, translator_input=translator_input)
                 except Exception:
-                    pass
-                finally:
-                    try:
-                        remember_line = getattr(plugin, 'remember_original_line', None)
-                        if callable(remember_line) and translator_input:
-                            remember_line(translator_input)
-                    except Exception:
-                        pass
+                    logging.exception('Translation plugin failed: %s', getattr(plugin, 'name', type(plugin).__name__))
 
-            if translation_results:
-                if len(translation_results) == 1:
-                    display_text = f"{current_text.rstrip()}\n{translation_results[0][1]}\n\n"
-                else:
-                    formatted_translations = "\n".join(
-                        f"[{plugin_name}] {translated_text}"
-                        for plugin_name, translated_text in translation_results
-                    )
-                    display_text = f"{current_text.rstrip()}\n{formatted_translations}\n\n"
-            else:
-                display_text = current_text
+            if len(translation_results) == 1:
+                display_text = f"{current_text.rstrip()}\n{translation_results[0][1]}\n\n"
+            elif translation_results:
+                formatted_translations = "\n".join(
+                    f"[{plugin_name}] {translated_text}"
+                    for plugin_name, translated_text in translation_results
+                )
+                display_text = f"{current_text.rstrip()}\n{formatted_translations}\n\n"
             self.log_pipeline('bundle.translation_phase_complete', display_text=display_text, clipboard_text=clipboard_text)
-        else:
-            execution_order = [p for p in self.plugin_order if p in self.active_plugins]
-            clipboard_current = current_text
-            for plugin_filename in execution_order:
-                if plugin_filename in self.plugins:
-                    plugin = self.plugins[plugin_filename]
-                    if plugin.enabled:
-                        try:
-                            result = plugin.process_clipboard_text(clipboard_current)
-                            if result is None:
-                                self.log_pipeline('clipboard.plugin_dropped', plugin=plugin_filename, incoming=clipboard_current)
-                                return display_text, None
-                            self.log_pipeline('clipboard.plugin_result', plugin=plugin_filename, output=result)
-                            clipboard_current = result
-                        except Exception:
-                            pass
-            clipboard_text = clipboard_current.strip() if isinstance(clipboard_current, str) else clipboard_current
 
         for plugin in post_translation_plugins:
             try:
@@ -1096,11 +1182,49 @@ class SugoiHookGUI:
                 self.log_pipeline('post_translation.plugin_result', plugin=getattr(plugin, 'name', type(plugin).__name__), output=result)
                 display_text = result
             except Exception:
-                pass
+                logging.exception('Post-translation plugin failed: %s', getattr(plugin, 'name', type(plugin).__name__))
 
         self.log_pipeline('output.summary', translator_input=translator_input, output_window_text=display_text, clipboard_text=clipboard_text)
-        self.log_pipeline('bundle.complete', display_text=display_text, clipboard_text=clipboard_text)
         return display_text, clipboard_text
+
+    def remember_translation_context(self, prepared):
+        translator_input = prepared['translator_input']
+        for plugin in prepared['translation_plugins']:
+            try:
+                remember_line = getattr(plugin, 'remember_original_line', None)
+                if callable(remember_line) and translator_input:
+                    remember_line(translator_input)
+            except Exception:
+                logging.exception('Failed to remember translation context for %s', getattr(plugin, 'name', type(plugin).__name__))
+
+    def deliver_plugin_output_bundle(self, completed, prepared):
+        self.remember_translation_context(prepared)
+        processed_text, clipboard_text = completed
+        self.run_on_ui_thread(
+            self._append_output_ui,
+            processed_text,
+            clipboard_text,
+            prepared['allow_auto_copy'],
+        )
+
+    def handle_output_pipeline_error(self, stage, exc):
+        logging.error('Output pipeline %s failed: %s: %s', stage, type(exc).__name__, exc, exc_info=(type(exc), exc, exc.__traceback__))
+        self.run_on_ui_thread(self.notify_user, f"Output pipeline error during {stage}.", 'error', 6000)
+
+    def handle_stale_output_bundle(self, prepared, generation, invalidated):
+        self.log_pipeline('append_output.stale_discarded', incoming=prepared.get('incoming'), translator_input=prepared.get('translator_input'), generation=generation, invalidated=invalidated)
+
+    def handle_superseded_output_bundle(self, prepared, generation):
+        self.log_pipeline('append_output.superseded_delivered', incoming=prepared.get('incoming'), translator_input=prepared.get('translator_input'), generation=generation)
+
+    def process_plugin_output_bundle(self, text):
+        """Synchronously process one line for compatibility with direct callers."""
+        prepared = self.prepare_plugin_output_bundle(text)
+        if prepared is None:
+            return None, None
+        completed = self.complete_plugin_output_bundle(prepared)
+        self.remember_translation_context(prepared)
+        return completed
 
     def process_text_through_plugins(self, text):
         """Process text through all active plugins for display output."""
@@ -1112,56 +1236,34 @@ class SugoiHookGUI:
         _processed_text, clipboard_text = self.process_plugin_output_bundle(text)
         return clipboard_text
 
-    def submit_output_processing(self, text, allow_auto_copy=False):
-        """Queue output processing and keep only the newest pending line."""
-        with self.output_worker_condition:
-            self.output_request_generation += 1
-            generation = self.output_request_generation
-            self.output_latest_generation = generation
-            self.output_pending_request = {
-                'generation': generation,
-                'text': text,
-                'allow_auto_copy': allow_auto_copy,
-            }
-            self.output_worker_condition.notify()
-        self.log_pipeline('append_output.queued', incoming=text, allow_auto_copy=allow_auto_copy, generation=generation)
+    def submit_output_processing(self, text, allow_auto_copy=False, front=False):
+        """Queue raw text losslessly for ordered stateful preprocessing."""
+        self.output_pipeline.submit(text, allow_auto_copy, front=front)
+        self.log_pipeline('append_output.queued', incoming=text, allow_auto_copy=allow_auto_copy, front=front)
+
+    def schedule_pipeline_callback(self, wait_ms, callback):
+        epoch = self.output_pipeline.get_invalidation_epoch()
+        cancelled = threading.Event()
+
+        def run_serialized_callback():
+            with self.output_processing_lock:
+                if cancelled.is_set() or not self.output_pipeline.is_epoch_current(epoch):
+                    return
+                callback()
+
+        pipeline_handle = self.output_pipeline.schedule_callback(wait_ms, run_serialized_callback)
+        return pipeline_handle, cancelled
+
+    def cancel_pipeline_callback(self, handle):
+        if not handle:
+            return
+        pipeline_handle, cancelled = handle
+        cancelled.set()
+        self.output_pipeline.cancel_callback(pipeline_handle)
 
     def invalidate_output_processing(self, clear_pending=False):
-        """Mark any in-flight output work stale so late results are ignored."""
-        with self.output_worker_condition:
-            self.output_request_generation += 1
-            self.output_latest_generation = self.output_request_generation
-            if clear_pending:
-                self.output_pending_request = None
-
-    def output_processing_worker(self):
-        """Process plugin output off the UI thread while dropping stale work."""
-        while True:
-            with self.output_worker_condition:
-                while not self.output_worker_shutdown and self.output_pending_request is None:
-                    self.output_worker_condition.wait()
-
-                if self.output_worker_shutdown:
-                    return
-
-                request = self.output_pending_request
-                self.output_pending_request = None
-
-            generation = request['generation']
-            text = request['text']
-            allow_auto_copy = request['allow_auto_copy']
-
-            with self.output_processing_lock:
-                processed_text, clipboard_text = self.process_plugin_output_bundle(text)
-
-            with self.output_worker_condition:
-                is_stale = generation != self.output_latest_generation
-
-            if is_stale:
-                self.log_pipeline('append_output.stale_discarded', incoming=text, allow_auto_copy=allow_auto_copy, generation=generation)
-                continue
-
-            self.run_on_ui_thread(self._append_output_ui, processed_text, clipboard_text, allow_auto_copy)
+        """Invalidate in-flight translation and optionally clear queued preprocessing."""
+        self.output_pipeline.invalidate(clear_pending=clear_pending)
 
     def _append_output_ui(self, processed_text_value, clipboard_text_value, allow_auto_copy):
         self.log_pipeline('append_output.ui', processed_text=processed_text_value, clipboard_text=clipboard_text_value, allow_auto_copy=allow_auto_copy)
@@ -1172,22 +1274,16 @@ class SugoiHookGUI:
             self.output_text.config(state='disabled')
             self.update_statistics(processed_text_value)
 
-        fallback_auto_copy = (
-            not allow_auto_copy
-            and self.auto_copy_enabled.get()
-            and clipboard_text_value is not None
-        )
-
-        if self.auto_copy_enabled.get() and (allow_auto_copy or fallback_auto_copy) and clipboard_text_value is not None:
-            self.log_pipeline('append_output.auto_copy', clipboard_text=clipboard_text_value, allow_auto_copy=allow_auto_copy, fallback_auto_copy=fallback_auto_copy)
+        if self.auto_copy_enabled.get() and allow_auto_copy and clipboard_text_value is not None:
+            self.log_pipeline('append_output.auto_copy', clipboard_text=clipboard_text_value, allow_auto_copy=allow_auto_copy)
             self.auto_copy_text(clipboard_text_value)
         else:
-            self.log_pipeline('append_output.no_auto_copy', clipboard_text=clipboard_text_value, allow_auto_copy=allow_auto_copy, fallback_auto_copy=fallback_auto_copy, auto_copy_enabled=self.auto_copy_enabled.get())
+            self.log_pipeline('append_output.no_auto_copy', clipboard_text=clipboard_text_value, allow_auto_copy=allow_auto_copy, auto_copy_enabled=self.auto_copy_enabled.get())
 
     def reset_all_plugins(self):
         """Reset state of all plugins"""
-        self.invalidate_output_processing(clear_pending=True)
         with self.output_processing_lock:
+            self.invalidate_output_processing(clear_pending=True)
             for plugin in self.plugins.values():
                 try:
                     plugin.reset()
@@ -1841,9 +1937,10 @@ class SugoiHookGUI:
 
             collect_current_draft_values()
 
-            for setting_name, value in draft_values.items():
-                plugin.set_setting(setting_name, value)
-                self.plugin_settings[plugin_filename][setting_name] = value
+            with self.output_processing_lock:
+                for setting_name, value in draft_values.items():
+                    plugin.set_setting(setting_name, value)
+                    self.plugin_settings[plugin_filename][setting_name] = value
 
             self.save_plugins_config()
             self.update_hook_status_panel()
@@ -2031,7 +2128,7 @@ class SugoiHookGUI:
                 if saved_hook_id in self.hooks:
                     # Check if there are multiple hooks with same function name
                     hooks_with_same_function = [
-                        hid for hid, hook in self.hooks.items()
+                        hid for hid, hook in self.get_hooks_snapshot().items()
                         if hook.get('function') == saved_function
                     ]
                     
@@ -2070,7 +2167,7 @@ class SugoiHookGUI:
                 # Strategy 2: If saved ID not found, try matching by function + text sample
                 if not matched_hook_id and saved_function:
                     hooks_with_function = [
-                        hid for hid, hook in self.hooks.items()
+                        hid for hid, hook in self.get_hooks_snapshot().items()
                         if hook.get('function') == saved_function
                     ]
                     
@@ -3300,9 +3397,13 @@ class SugoiHookGUI:
     
     def reload_plugins(self):
         """Reload all plugins from the plugins folder"""
-        self.shutdown_plugin_instances()
-        self.plugins.clear()
-        self.discover_plugins()
+        active_plugins = list(self.active_plugins)
+        with self.output_processing_lock:
+            self.invalidate_output_processing(clear_pending=True)
+            self.shutdown_plugin_instances()
+            self.active_plugins = active_plugins
+            self.plugins.clear()
+            self.discover_plugins()
         self.refresh_plugins_list()
         
         # Update count label
@@ -3638,7 +3739,8 @@ class SugoiHookGUI:
             self.update_hook_action_state()
             
             self.is_reading = True
-            self.hooks.clear()
+            with self.hooks_lock:
+                self.hooks.clear()
             self.hook_tree.delete(*self.hook_tree.get_children())
             
             threading.Thread(target=self.read_cli_output, daemon=True).start()
@@ -3828,6 +3930,27 @@ For more information, refer to the Luna Hook documentation and current community
         self.engine_var.set("luna")
         self.current_engine = "luna"
     
+    def route_hook_output(self, hook_id, text, event_sequence):
+        with self.output_processing_lock:
+            concat_state = self.get_hook_concatenation_state()
+            concat_owns_hook = concat_state['active'] and hook_id in concat_state['hook_ids']
+            if concat_owns_hook:
+                self.mark_hook_event_submitted(hook_id, event_sequence)
+                self.append_output(f"[Hook #{hook_id}|{event_sequence}] {text}\n", True, False)
+                return 'concatenation'
+            if self.selected_hook_id and hook_id == self.selected_hook_id:
+                if text:
+                    self.mark_hook_event_submitted(hook_id, event_sequence)
+                    self.append_output(text + "\n", True, True)
+                    return 'selected'
+                return None
+            if not self.selected_hook_id and not self.silent_auto_launch:
+                # Only show hook preview if not in silent auto-launch mode
+                self.mark_hook_event_submitted(hook_id, event_sequence)
+                self.append_output(f"[Hook #{hook_id}] {text}\n", True, False)
+                return 'preview'
+        return None
+
     def read_cli_output(self):
         """Read output from the Luna CLI process."""
         self.read_luna_output()
@@ -3852,7 +3975,7 @@ For more information, refer to the Luna Hook documentation and current community
                 console_match = console_pattern.match(line)
                 if console_match:
                     text_to_process = f"[Console] {console_match.group(1)}\n"
-                    self.root.after(0, self.append_output, text_to_process, True, False)
+                    self.append_output(text_to_process, True, False)
                     continue
                 
                 # Check for hook output
@@ -3870,26 +3993,37 @@ For more information, refer to the Luna Hook documentation and current community
                     else:
                         thread_name = "Unknown"
                     
-                    if hook_id not in self.hooks:
-                        self.hooks[hook_id] = {
-                            'id': hook_id,
-                            'function': thread_name,
-                            'texts': []
-                        }
-                        self.root.after(0, self.add_hook_to_list, hook_id, thread_name)
+                    now = time.monotonic()
+                    with self.output_processing_lock:
+                        with self.hooks_lock:
+                            is_new_hook = hook_id not in self.hooks
+                            if is_new_hook:
+                                self.hooks[hook_id] = {
+                                    'id': hook_id,
+                                    'function': thread_name,
+                                    'context_info': context_info,
+                                    'texts': [],
+                                    'latest_text': '',
+                                    'last_seen_monotonic': 0.0,
+                                    'latest_event_sequence': 0,
+                                    'last_pipeline_sequence': 0,
+                                    'last_processed_sequence': 0,
+                                }
+                            self.hook_event_sequence += 1
+                            event_sequence = self.hook_event_sequence
+                            hook_info = self.hooks[hook_id]
+                            hook_info['latest_text'] = text
+                            hook_info['last_seen_monotonic'] = now
+                            hook_info['latest_event_sequence'] = event_sequence
+                            hook_info['latest_event_snapshot'] = (text, now, event_sequence)
+                            if len(hook_info['texts']) < MAX_HOOK_TEXTS:
+                                hook_info['texts'].append(text)
+                        self.route_hook_output(hook_id, text, event_sequence)
+                    if is_new_hook:
+                        self.run_on_ui_thread(self.add_hook_to_list, hook_id, thread_name)
                     
                     # Store text and update preview
-                    if len(self.hooks[hook_id]['texts']) < 3:
-                        self.hooks[hook_id]['texts'].append(text)
-                    
-                    self.root.after(0, self.update_hook_preview, hook_id, text)
-                    
-                    if self.selected_hook_id and hook_id == self.selected_hook_id:
-                        if text:
-                            self.root.after(0, self.append_output, text + "\n", True, True)
-                    elif not self.selected_hook_id and not self.silent_auto_launch:
-                        # Only show hook preview if not in silent auto-launch mode
-                        self.root.after(0, self.append_output, f"[Hook #{hook_id}] {text}\n", True, False)
+                    self.run_on_ui_thread(self.update_hook_preview, hook_id, text)
                 
             except Exception:
                 break
@@ -3974,8 +4108,11 @@ For more information, refer to the Luna Hook documentation and current community
             self.append_event(f"Function: {item['values'][1]}\n")
             self.append_event("─" * 50 + "\n\n")
             
-            if hook_id in self.hooks and self.hooks[hook_id]['texts']:
-                for text in self.hooks[hook_id]['texts']:
+            hook_info = self.get_hooks_snapshot().get(hook_id, {})
+            concat_state = self.get_hook_concatenation_state()
+            concat_owns_hook = concat_state['active'] and hook_id in concat_state['hook_ids']
+            if hook_info.get('texts') and not concat_owns_hook:
+                for text in hook_info['texts']:
                     self.append_output(f"{text}\n", True, True)
                 self.append_event("\n" + "─" * 50 + "\n\n")
             
@@ -4057,7 +4194,7 @@ For more information, refer to the Luna Hook documentation and current community
 
     def get_hook_concat_selector_value(self, hook_id: str) -> str:
         """Return the preferred selector value for hook concatenation."""
-        hook_info = self.hooks.get(str(hook_id), {})
+        hook_info = self.get_hooks_snapshot().get(str(hook_id), {})
         function_name = str(hook_info.get('function', '')).strip()
         context_info = str(hook_info.get('context_info', '')).strip()
         return function_name or context_info or str(hook_id).strip()
@@ -4070,7 +4207,7 @@ For more information, refer to the Luna Hook documentation and current community
         if normalized_selector.isdigit():
             return normalized_selector
 
-        for hook_id, hook_info in self.hooks.items():
+        for hook_id, hook_info in self.get_hooks_snapshot().items():
             context_info = str(hook_info.get('context_info', '')).strip()
             function_name = str(hook_info.get('function', '')).strip()
             if normalized_selector in {context_info, function_name}:
@@ -4098,6 +4235,10 @@ For more information, refer to the Luna Hook documentation and current community
 
     def set_hook_concat_role(self, hook_id: str, role: str):
         """Assign a hook directly to the hook concatenation plugin."""
+        with self.output_processing_lock:
+            return self._set_hook_concat_role_unlocked(hook_id, role)
+
+    def _set_hook_concat_role_unlocked(self, hook_id: str, role: str):
         plugin_filename = self.get_plugin_filename_by_name('Hook Concatenation')
         if not plugin_filename or plugin_filename not in self.plugins:
             self.notify_user("Hook Concatenation plugin is not available.", level='warning')
@@ -4292,7 +4433,8 @@ For more information, refer to the Luna Hook documentation and current community
         
         self.attached_pid = None
         self.selected_hook_id = None
-        self.hooks.clear()
+        with self.hooks_lock:
+            self.hooks.clear()
         self.hook_tree.delete(*self.hook_tree.get_children())
         
         # Reset all plugins state
@@ -4433,15 +4575,15 @@ For more information, refer to the Luna Hook documentation and current community
             
             def refresh_processes_from_tray(icon, item):
                 """Refresh process list from system tray"""
-                self.refresh_processes()
+                self.run_on_ui_thread(self.refresh_processes)
             
             def clear_output_from_tray(icon, item):
                 """Clear output from system tray"""
-                self.clear_output()
+                self.run_on_ui_thread(self.clear_output)
             
             def copy_to_clipboard_from_tray(icon, item):
                 """Copy text to clipboard from system tray"""
-                self.copy_to_clipboard()
+                self.run_on_ui_thread(self.copy_to_clipboard)
             
             # Create enhanced menu with more options
             menu = pystray.Menu(
@@ -4482,6 +4624,9 @@ For more information, refer to the Luna Hook documentation and current community
     
     def show_window(self, icon=None, item=None):
         """Show the main window"""
+        if threading.current_thread() is not threading.main_thread():
+            self.run_on_ui_thread(self.show_window)
+            return
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -4496,6 +4641,9 @@ For more information, refer to the Luna Hook documentation and current community
     
     def hide_to_tray(self, icon=None, item=None):
         """Hide window to system tray"""
+        if threading.current_thread() is not threading.main_thread():
+            self.run_on_ui_thread(self.hide_to_tray)
+            return
         if TRAY_AVAILABLE:
             self.root.withdraw()
             self.is_minimized_to_tray = True
@@ -4513,13 +4661,25 @@ For more information, refer to the Luna Hook documentation and current community
     
     def quit_app(self, icon=None, item=None):
         """Completely quit the application"""
+        if threading.current_thread() is not threading.main_thread():
+            self.run_on_ui_thread(self.quit_app)
+            return
+        if self.shutdown_started:
+            return
+        self.shutdown_started = True
         # Save configuration on exit
         self.save_plugins_config()
+        self.output_pipeline.stop()
+        with self.output_processing_lock:
+            self.shutdown_plugin_instances()
         
         if self.cli_process:
             self.detach_process()
         if TRAY_AVAILABLE and self.tray_icon:
             self.tray_icon.stop()
+        with self.ui_callback_lock:
+            self.ui_callback_shutdown = True
+            self.ui_callback_queue.clear()
         self.root.quit()
         self.root.destroy()
     
@@ -4564,17 +4724,7 @@ For more information, refer to the Luna Hook documentation and current community
     def on_closing(self):
         """Handle window closing"""
         # Save configuration on close
-        self.save_plugins_config()
-        with self.output_worker_condition:
-            self.output_worker_shutdown = True
-            self.output_pending_request = None
-            self.output_worker_condition.notify_all()
-
-        self.shutdown_plugin_instances()
-        
-        if self.cli_process:
-            self.detach_process()
-        self.root.destroy()
+        self.quit_app()
 
 def main():
     log_path = setup_runtime_logging()

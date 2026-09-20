@@ -16,7 +16,7 @@ A fork of SugoiHook - a Windows GUI for attaching to game processes, selecting t
 - Updated the build scripts to match the current repo layout and preserve runtime `*_config.json` files across clean builds.
 - Reworked the main UI layout: fixed header, better section collapsing, compact/full geometry restore, clearer hook/process flow, and split `Session Events` / `Session Output`.
 - Improved plugin management with explicit controls, better defaults, and a live preview in the Overlay Window settings.
-- Stabilized the text pipeline: shared pre-translation flow, clipboard alignment with translator input, async latest-wins output processing, safer Hook Concatenation behavior, and less aggressive duplicate filtering.
+- Stabilized the text pipeline: shared pre-translation flow, clipboard alignment with translator input, lossless preprocessing with latest-pending translation, safer Hook Concatenation behavior, and less aggressive duplicate filtering.
 - Expanded debugging and runtime logging, including console-visible pipeline tracing and sanitized outbound OpenAI payload logging.
 - Added support for `gpt-4o` and `gpt-4o-mini` in the OpenAI translation plugin.
 - Finalized the onefile release path, including persistent config/log files beside the exe and bundled plain/debug shortcuts.
@@ -192,7 +192,7 @@ Important behavior:
 - clipboard gets that same untranslated translator input
 - configurable via concat plugin to include prefix or just clip dialogue-only
 - rolling original-line context can be sent to OpenAI for continuity
-- output processing is async and latest-wins, so rapidly advancing lines does not force the UI to catch up one stale translation at a time
+- output processing preserves every hook event for stateful plugins, delivers the active translation, and keeps only the newest pending translation so rapid advancement cannot create an unbounded backlog
 
 ### Plugin Management
 
