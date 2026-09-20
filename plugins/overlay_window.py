@@ -9,6 +9,7 @@ import sys
 import json
 import re
 import logging
+import threading
 from pathlib import Path
 
 from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
@@ -79,6 +80,7 @@ class OverlayWindowPlugin(HookPlugin):
         self.dictionary_status_after_id = None
         self.dictionary_lookup_char_pattern = DICTIONARY_LOOKUP_CHAR_PATTERN
         self._last_dictionary_status_log = None
+        self._dictionary_lookup_generation = 0
         
         # Default configuration
         self.config = {
@@ -202,6 +204,7 @@ class OverlayWindowPlugin(HookPlugin):
         return min_width
 
     def on_disable(self):
+        self._invalidate_dictionary_lookup()
         if self.dictionary_status_after_id and self.overlay:
             try:
                 self.overlay.after_cancel(self.dictionary_status_after_id)
@@ -499,6 +502,7 @@ class OverlayWindowPlugin(HookPlugin):
 
     def update_text(self, text, is_translator_enabled):
         if self.text_widget:
+            self._invalidate_dictionary_lookup()
             self._debug("update_text", text_len=len(text), translator_enabled=is_translator_enabled)
             self.clear_dictionary_highlight()
             self.text_widget.config(state='normal')
@@ -539,6 +543,7 @@ class OverlayWindowPlugin(HookPlugin):
             self.text_widget.config(state='disabled')
 
     def init_dictionary_system(self):
+        self._invalidate_dictionary_lookup()
         if not self.config.get('dictionary_enabled', True):
             return
         app = getattr(self, 'app', None)
@@ -673,7 +678,10 @@ class OverlayWindowPlugin(HookPlugin):
         if self.dictionary_backend is None or self.text_widget is None:
             return
 
-        status = self.dictionary_backend.get_status()
+        lookup_generation = self._invalidate_dictionary_lookup()
+        backend = self.dictionary_backend
+
+        status = backend.get_status()
         if status['error']:
             self.set_dictionary_text(status['progress_message'])
             return
@@ -697,7 +705,76 @@ class OverlayWindowPlugin(HookPlugin):
             return
 
         run_start, run_text, local_offset = run_details
-        lookup_result = self.dictionary_backend.lookup_run_covering_offset(run_text, local_offset)
+        self.set_dictionary_text(f"Looking up:\n{run_text}")
+        threading.Thread(
+            target=self._run_dictionary_lookup,
+            args=(lookup_generation, backend, run_start, run_text, local_offset, select_match),
+            name=f"dictionary-lookup-{lookup_generation}",
+            daemon=True,
+        ).start()
+
+    def _invalidate_dictionary_lookup(self):
+        self._dictionary_lookup_generation = getattr(self, '_dictionary_lookup_generation', 0) + 1
+        return self._dictionary_lookup_generation
+
+    def _run_dictionary_lookup(
+        self,
+        lookup_generation,
+        backend,
+        run_start,
+        run_text,
+        local_offset,
+        select_match,
+    ):
+        lookup_result = None
+        error_message = ""
+        try:
+            lookup_result = backend.lookup_run_covering_offset(run_text, local_offset)
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            logging.exception("Dictionary lookup failed")
+
+        app = getattr(self, 'app', None)
+        run_on_ui_thread = getattr(app, 'run_on_ui_thread', None)
+        if not callable(run_on_ui_thread):
+            logging.warning("Discarding dictionary lookup result because no UI dispatcher is available")
+            return
+        run_on_ui_thread(
+            self._complete_dictionary_lookup,
+            lookup_generation,
+            backend,
+            run_start,
+            run_text,
+            select_match,
+            lookup_result,
+            error_message,
+        )
+
+    def _complete_dictionary_lookup(
+        self,
+        lookup_generation,
+        backend,
+        run_start,
+        run_text,
+        select_match,
+        lookup_result,
+        error_message,
+    ):
+        if (
+            lookup_generation != getattr(self, '_dictionary_lookup_generation', 0)
+            or backend is not self.dictionary_backend
+            or self.overlay is None
+            or self.text_widget is None
+        ):
+            self._debug("lookup_stale", generation=lookup_generation)
+            return
+
+        if error_message:
+            self.clear_dictionary_highlight()
+            self.set_dictionary_text(f"Dictionary lookup failed:\n{error_message}")
+            self._debug("lookup_failed", reason=error_message)
+            return
+
         if lookup_result is None:
             self.clear_dictionary_highlight()
             self.set_dictionary_text(f"No dictionary match found for:\n{run_text}")

@@ -246,6 +246,7 @@ Current behavior:
 - uses the bundled Jitendex dictionary from `dictionaries/jitendex`
 - builds a persistent local SQLite cache on first use
 - supports single-click / double-click lookup from overlay text
+- runs lookups off the UI thread and discards results made stale by newer text or clicks
 - prefers the longest match around the clicked position
 - includes common Japanese deinflection and contraction handling
 - shows up to 3 match candidates for the chosen span

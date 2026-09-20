@@ -992,7 +992,7 @@ class JitendexDictionary:
                 seen_keys.add(key)
                 expanded.append(entry)
 
-        return expanded[: max(entries_per_match, len(expanded))]
+        return expanded[:entries_per_match]
 
     def _lookup_entries_for_term(
         self,
