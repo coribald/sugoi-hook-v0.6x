@@ -17,13 +17,14 @@ if exist "%OUTPUT_DIR%\*_config.json" copy /y "%OUTPUT_DIR%\*_config.json" "%PRE
 echo Cleaning previous release build artifacts...
 if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
 
-REM Check if Nuitka and onefile compression support are installed
-python -c "import nuitka, zstandard" 2>nul
+echo Installing pinned runtime and build dependencies...
+python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-build.txt
 if errorlevel 1 (
-    echo Nuitka and/or zstandard not found. Installing...
-    python -m pip install nuitka zstandard
-    echo.
+    echo Failed to install pinned dependencies.
+    if /I not "%NO_PAUSE%"=="1" pause
+    exit /b 1
 )
+echo.
 
 echo Starting Nuitka compilation...
 echo This creates a SINGLE EXE file with ALL runtime assets bundled
@@ -71,7 +72,7 @@ if errorlevel 1 (
     echo Build Failed!
     echo ========================================
     echo.
-    pause
+    if /I not "%NO_PAUSE%"=="1" pause
     exit /b 1
 )
 
@@ -116,4 +117,4 @@ echo ========================================
 echo.
 echo Executable created: %OUTPUT_DIR%\SugoiHook.exe
 echo.
-pause
+if /I not "%NO_PAUSE%"=="1" pause

@@ -96,6 +96,7 @@ Sugoi Hook is currently packaged as a Luna-only build:
 ```powershell
 git clone https://github.com/coribald/sugoi-hook-v0.6x.git
 cd sugoi-hook-v0.6x
+python -m pip install -r requirements.txt
 python SugoiHook_gui.py
 ```
 
@@ -123,9 +124,18 @@ Debug standalone build:
 build_debug_standalone.bat
 ```
 
+Both scripts install the pinned runtime and build dependencies from
+`requirements.txt` and `requirements-build.txt`. To run either script without
+waiting at its final prompt (for automation), use:
+
+```powershell
+$env:NO_PAUSE = "1"; .\build.bat
+```
+
 Current build behavior:
 
 - uses repo-local pip and Nuitka caches
+- uses Nuitka 4.0.7 and zstandard 0.25.0 from `requirements-build.txt`
 - includes the runtime asset folders used by the app:
   - `luna_builds/`
   - `deep_translator/`

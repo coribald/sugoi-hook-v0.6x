@@ -18,12 +18,14 @@ if exist "%DIST_DIR%\*_config.json" copy /y "%DIST_DIR%\*_config.json" "%PRESERV
 echo Cleaning previous debug build artifacts...
 if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
 
-python -c "import nuitka, zstandard" 2>nul
+echo Installing pinned runtime and build dependencies...
+python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-build.txt
 if errorlevel 1 (
-    echo Nuitka and/or zstandard not found. Installing...
-    python -m pip install nuitka zstandard
-    echo.
+    echo Failed to install pinned dependencies.
+    if /I not "%NO_PAUSE%"=="1" pause
+    exit /b 1
 )
+echo.
 
 echo Starting standalone debug build...
 echo.
@@ -65,7 +67,7 @@ if errorlevel 1 (
     echo Debug Build Failed!
     echo ========================================
     echo.
-    pause
+    if /I not "%NO_PAUSE%"=="1" pause
     exit /b 1
 )
 
@@ -80,4 +82,4 @@ echo Debug Build Complete!
 echo ========================================
 echo.
 echo Executable created: %DIST_DIR%\SugoiHook_debug.exe
-pause
+if /I not "%NO_PAUSE%"=="1" pause
