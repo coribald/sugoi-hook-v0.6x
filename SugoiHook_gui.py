@@ -24,6 +24,7 @@ from pathlib import Path
 from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_session import LunaProcessSession
 from luna_controller import LunaController, LunaHookTextEvent
+from plugin_settings_dialog import PluginSettingsDialog
 from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
@@ -1703,6 +1704,21 @@ class SugoiHookGUI:
                 menu.grab_release()
     
     def configure_selected_plugin(self):
+        """Open the extracted plugin settings view for the selected plugin."""
+        selection = self.plugins_tree.selection()
+        if not selection:
+            return
+        plugin_name = self.plugins_tree.item(selection[0])['values'][1]
+        plugin_filename = next((name for name, plugin in self.plugins.items() if plugin.name == plugin_name), None)
+        if plugin_filename is None:
+            return
+        PluginSettingsDialog(
+            self.root, self.colors, notify=self.notify_user,
+            save=self.save_plugin_settings_transactionally,
+            on_saved=lambda: (self.update_hook_status_panel(), self.update_hook_action_state()),
+        ).open(plugin_filename, self.plugins[plugin_filename])
+
+    def _configure_selected_plugin_legacy(self):
         """Open configuration dialog for selected plugin with scrollable content"""
         selection = self.plugins_tree.selection()
         if not selection:
