@@ -293,7 +293,13 @@ OpenAI logging only emits when the app itself is running in debug mode, and the 
 ```text
 sugoi-hook/
 ├── SugoiHook_gui.py
+├── sugoihook_app.py
 ├── luna_session.py
+├── luna_controller.py
+├── main_window.py
+├── plugin_settings_dialog.py
+├── profile_manager_dialog.py
+├── hook_help_dialog.py
 ├── output_pipeline.py
 ├── dictionary_backend.py
 ├── dictionaries/

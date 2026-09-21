@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 import SugoiHook_gui as gui
+import sugoihook_app
 from luna_session import LunaProcessSession
 from runtime_context import resolve_runtime_context
 from ui_dispatcher import UIThreadDispatcher
@@ -23,6 +24,11 @@ from hook_registry import HookRegistry
 
 gui.sys.stdout = gui.ORIGINAL_STDOUT
 gui.sys.stderr = gui.ORIGINAL_STDERR
+
+
+class CompatibilityEntrypointTests(unittest.TestCase):
+    def test_gui_module_reexports_application_coordinator(self):
+        self.assertIs(gui.SugoiHookGUI, sugoihook_app.SugoiHookGUI)
 
 
 class RecordingRoot:
