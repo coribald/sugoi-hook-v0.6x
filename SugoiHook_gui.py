@@ -27,6 +27,7 @@ from luna_controller import LunaController, LunaHookTextEvent
 from plugin_settings_dialog import PluginSettingsDialog
 from profile_manager_dialog import ProfileManagerDialog
 from hook_help_dialog import show_hook_help as show_hook_help_dialog
+from main_window import MainWindowView
 from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
@@ -3113,6 +3114,26 @@ class SugoiHookGUI:
             pass
         
     def setup_ui(self):
+        """Build the extracted main-window shell and connect section callbacks."""
+        self.engine_var = tk.StringVar(value=self.current_engine)
+        widgets = MainWindowView(self.root, self.colors).build(
+            engine=self.current_engine,
+            create_process=lambda parent: (setattr(self, 'selection_cards_frame', parent), self.create_process_card(parent))[1],
+            create_hook=self.create_hook_card,
+            create_plugins=self.create_plugins_card,
+            create_output=self.create_output_card,
+            update_selection_layout=self.update_selection_cards_layout,
+            configure_wheel=self.configure_mousewheel_routing,
+        )
+        self.canvas = widgets.canvas
+        self.scrollbar = widgets.scrollbar
+        self.canvas_shell = widgets.canvas_shell
+        self.selection_cards_frame = widgets.selection_cards_frame
+        self.scrollbar_visible = True
+        self.update_scrollbar_visibility = widgets.update_scrollbar_visibility
+        self.configure_mousewheel_routing(self.canvas_shell)
+
+    def _setup_ui_legacy(self):
         """Create the modern GUI layout with a fixed header and scrollable content area."""
         header_frame = ttk.Frame(self.root, style="TFrame", padding=(15, 15, 15, 0))
         header_frame.pack(fill=tk.X)
