@@ -27,6 +27,7 @@ from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
 from game_profile_store import GameProfileStore
+from process_service import ProcessService, windows_process_architecture
 from runtime_context import resolve_runtime_context
 from ui_dispatcher import UIThreadDispatcher
 
@@ -385,6 +386,7 @@ class SugoiHookGUI:
             'notepad.exe', 'mspaint.exe', 'calc.exe', 'snippingtool.exe',
             'sugoi_hook.exe'
         }
+        self.process_service = self._create_process_service()
         
         # Determine CLI paths - handle both development and compiled modes
         self.runtime_context = resolve_runtime_context(module_path=__file__)
@@ -498,6 +500,22 @@ class SugoiHookGUI:
                 issue_reporter=self.report_config_issue,
             )
         return self.game_profile_store
+
+    def _create_process_service(self):
+        return ProcessService(
+            process_iter=psutil.process_iter,
+            visible_window=self.has_visible_window,
+            architecture=windows_process_architecture,
+            excluded_executables=getattr(self, 'excluded_executables', ()),
+            system_dirs=getattr(self, 'system_dirs', ()),
+            system_patterns=getattr(self, 'system_process_patterns', ()),
+            bloatware_patterns=getattr(self, 'bloatware_patterns', ()),
+        )
+
+    def _get_process_service(self):
+        if getattr(self, 'process_service', None) is None:
+            self.process_service = self._create_process_service()
+        return self.process_service
 
     def drain_ui_callbacks(self):
         """Compatibility delegate for callers that manually drain the queue."""
@@ -2573,7 +2591,7 @@ class SugoiHookGUI:
 
     def launch_executable(self, exe_path):
         """Launch a selected executable directly without invoking a shell."""
-        return subprocess.Popen([str(exe_path)])
+        return self._get_process_service().launch(exe_path)
     
     def open_profile_manager(self):
         """Open game profile management window"""
@@ -3761,6 +3779,7 @@ class SugoiHookGUI:
         Advanced filtering to exclude system processes and bloatware
         Returns True if process should be excluded
         """
+        return self._get_process_service().should_exclude(proc_name, proc_path)
         name_lower = proc_name.lower()
         
         # 1. Check exact executable name matches
@@ -3868,6 +3887,7 @@ class SugoiHookGUI:
     
     def get_process_architecture(self, pid):
         """Determine if a process is 32-bit or 64-bit"""
+        return windows_process_architecture(pid)
         try:
             if sys.platform == 'win32':
                 import ctypes
@@ -3885,6 +3905,14 @@ class SugoiHookGUI:
     
     def refresh_processes(self):
         """Refresh the list of running processes with advanced filtering"""
+        self.process_tree.delete(*self.process_tree.get_children())
+        self.all_processes = []
+        self.process_icons.clear()
+        for process_info in self._get_process_service().discover():
+            icon = self.get_process_icon(process_info.pid)
+            self.all_processes.append((process_info.pid, process_info.architecture, process_info.name, icon))
+        self.filter_processes()
+        return
         self.process_tree.delete(*self.process_tree.get_children())
         self.all_processes = []
         self.process_icons.clear()
