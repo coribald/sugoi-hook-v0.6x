@@ -26,6 +26,7 @@ from luna_session import LunaProcessSession
 from luna_controller import LunaController, LunaHookTextEvent
 from plugin_settings_dialog import PluginSettingsDialog
 from profile_manager_dialog import ProfileManagerDialog
+from hook_help_dialog import show_hook_help as show_hook_help_dialog
 from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
@@ -4202,6 +4203,10 @@ class SugoiHookGUI:
         return True
     
     def show_hook_help(self):
+        """Open the extracted hook-code help view."""
+        show_hook_help_dialog(self.root, self.colors)
+
+    def _show_hook_help_legacy(self):
         """Show help dialog for hook code syntax"""
         help_text = """
 HOOK CODE SYNTAX GUIDE
