@@ -18,6 +18,7 @@ import SugoiHook_gui as gui
 from luna_session import LunaProcessSession
 from runtime_context import resolve_runtime_context
 from ui_dispatcher import UIThreadDispatcher
+from hook_registry import HookRegistry
 
 
 gui.sys.stdout = gui.ORIGINAL_STDOUT
@@ -287,6 +288,22 @@ plugin = FailingPlugin()
         self.assertEqual(saved, [True])
         self.assertTrue(any("Failed to discover plugin" in message for message in logs.output))
         app.shutdown_plugin_instances()
+
+
+class HookRegistryCharacterizationTests(unittest.TestCase):
+    def test_snapshot_isolated_and_sequence_markers_monotonic(self):
+        registry = HookRegistry()
+        is_new, sequence = registry.record_text("7", "thread", "context", "first", 1.0, 3)
+        registry.record_text("7", "thread", "context", "second", 2.0, 3)
+        registry.mark_submitted("7", sequence)
+        registry.mark_processed("7", 2)
+        snapshot = registry.snapshot()
+        snapshot["7"]["texts"].append("mutated")
+
+        self.assertTrue(is_new)
+        self.assertEqual(snapshot["7"]["last_pipeline_sequence"], 1)
+        self.assertEqual(snapshot["7"]["last_processed_sequence"], 2)
+        self.assertEqual(registry.snapshot()["7"]["texts"], ["first", "second"])
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
 from game_profile_store import GameProfileStore
 from process_service import ProcessService, windows_process_architecture
+from hook_registry import HookRegistry
 from runtime_context import resolve_runtime_context
 from ui_dispatcher import UIThreadDispatcher
 
@@ -272,9 +273,7 @@ class SugoiHookGUI:
         self.luna_session_generation = 0
         self.luna_exit_callbacks = {}
         self.attached_pid = None
-        self.hooks = {}
-        self.hooks_lock = threading.Lock()
-        self.hook_event_sequence = 0
+        self.hook_registry = HookRegistry()
         self.selected_hook_id = None
         self.is_reading = False
         self.process_icons = {}
@@ -516,6 +515,15 @@ class SugoiHookGUI:
         if getattr(self, 'process_service', None) is None:
             self.process_service = self._create_process_service()
         return self.process_service
+
+    def _get_hook_registry(self):
+        if getattr(self, 'hook_registry', None) is None:
+            self.hook_registry = HookRegistry()
+        return self.hook_registry
+
+    hooks = property(lambda self: self._get_hook_registry().records, lambda self, value: setattr(self._get_hook_registry(), 'records', value))
+    hooks_lock = property(lambda self: self._get_hook_registry().lock, lambda self, value: setattr(self._get_hook_registry(), 'lock', value))
+    hook_event_sequence = property(lambda self: self._get_hook_registry().event_sequence, lambda self, value: setattr(self._get_hook_registry(), 'event_sequence', value))
 
     def drain_ui_callbacks(self):
         """Compatibility delegate for callers that manually drain the queue."""
@@ -810,29 +818,13 @@ class SugoiHookGUI:
         return None
 
     def get_hooks_snapshot(self):
-        with self.hooks_lock:
-            return {
-                str(hook_id): dict(hook_info)
-                for hook_id, hook_info in self.hooks.items()
-            }
+        return self._get_hook_registry().snapshot()
 
     def mark_hook_event_submitted(self, hook_id, event_sequence):
-        with self.hooks_lock:
-            hook_info = self.hooks.get(str(hook_id))
-            if hook_info is not None:
-                hook_info['last_pipeline_sequence'] = max(
-                    int(hook_info.get('last_pipeline_sequence') or 0),
-                    int(event_sequence),
-                )
+        self._get_hook_registry().mark_submitted(hook_id, event_sequence)
 
     def mark_hook_event_processed(self, hook_id, event_sequence):
-        with self.hooks_lock:
-            hook_info = self.hooks.get(str(hook_id))
-            if hook_info is not None:
-                hook_info['last_processed_sequence'] = max(
-                    int(hook_info.get('last_processed_sequence') or 0),
-                    int(event_sequence),
-                )
+        self._get_hook_registry().mark_processed(hook_id, event_sequence)
 
     def get_hook_concatenation_state(self):
         """Return whether hook concatenation mode is active and which hooks it is using."""
@@ -4306,29 +4298,9 @@ For more information, refer to the Luna Hook documentation and current community
                     
                     now = time.monotonic()
                     with self.output_processing_lock:
-                        with self.hooks_lock:
-                            is_new_hook = hook_id not in self.hooks
-                            if is_new_hook:
-                                self.hooks[hook_id] = {
-                                    'id': hook_id,
-                                    'function': thread_name,
-                                    'context_info': context_info,
-                                    'texts': [],
-                                    'latest_text': '',
-                                    'last_seen_monotonic': 0.0,
-                                    'latest_event_sequence': 0,
-                                    'last_pipeline_sequence': 0,
-                                    'last_processed_sequence': 0,
-                                }
-                            self.hook_event_sequence += 1
-                            event_sequence = self.hook_event_sequence
-                            hook_info = self.hooks[hook_id]
-                            hook_info['latest_text'] = text
-                            hook_info['last_seen_monotonic'] = now
-                            hook_info['latest_event_sequence'] = event_sequence
-                            hook_info['latest_event_snapshot'] = (text, now, event_sequence)
-                            if len(hook_info['texts']) < MAX_HOOK_TEXTS:
-                                hook_info['texts'].append(text)
+                        is_new_hook, event_sequence = self._get_hook_registry().record_text(
+                            hook_id, thread_name, context_info, text, now, MAX_HOOK_TEXTS
+                        )
                         self.route_hook_output(hook_id, text, event_sequence)
                     if is_new_hook:
                         self.run_on_ui_thread(self.add_hook_to_list, hook_id, thread_name)
