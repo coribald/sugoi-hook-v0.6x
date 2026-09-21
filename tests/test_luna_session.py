@@ -5,6 +5,7 @@ import unittest
 
 import SugoiHook_gui as gui
 from luna_session import LunaProcessSession
+from luna_controller import LunaController, parse_luna_output_line
 
 
 gui.sys.stdout = gui.ORIGINAL_STDOUT
@@ -58,6 +59,11 @@ class FakeProcess:
 
 
 class LunaProcessSessionTests(unittest.TestCase):
+    def make_controller(self, dispatch=lambda callback, *args: callback(*args), **callbacks):
+        process_factory = callbacks.pop('process_factory', lambda *args, **kwargs: FakeProcess(wait_event=threading.Event()))
+        return LunaController(
+            gui.HookRegistry(), dispatch, process_factory=process_factory, **callbacks,
+        )
     def test_send_is_bound_to_running_process(self):
         process = FakeProcess()
         session = LunaProcessSession(process, 1, 42, "game.exe")
@@ -83,76 +89,47 @@ class LunaProcessSessionTests(unittest.TestCase):
         self.assertEqual(return_code, -9)
 
     def test_stale_session_cannot_receive_commands(self):
-        app = gui.SugoiHookGUI.__new__(gui.SugoiHookGUI)
-        app.luna_session_lock = threading.RLock()
-        current = LunaProcessSession(FakeProcess(), 2, 42, "current.exe")
+        controller = self.make_controller()
+        current = controller.start(["luna"], 42, "current.exe")
         stale = LunaProcessSession(FakeProcess(), 1, 41, "stale.exe")
-        app.luna_session = current
 
         with self.assertRaises(RuntimeError):
-            app.send_luna_command("select 1", session=stale)
+            controller.send("select 1", session=stale)
 
         self.assertEqual(stale.process.stdin.writes, [])
 
     def test_unexpected_exit_clears_only_current_session(self):
-        app = gui.SugoiHookGUI.__new__(gui.SugoiHookGUI)
-        app.luna_session_lock = threading.RLock()
-        session = LunaProcessSession(FakeProcess(), 2, 42, "game.exe")
-        app.luna_session = session
-        app.cli_process = session.process
-        app.is_reading = True
-        app.luna_exit_callbacks = {}
-        app.attached_pid = 42
-        app.selected_hook_id = "7"
-        app.hooks_lock = threading.Lock()
-        app.hooks = {"7": {"texts": ["line"]}}
+        exits = []
+        controller = self.make_controller(on_session_exit=lambda session, code, expected: exits.append((code, expected)))
+        session = controller.start(["luna"], 42, "game.exe")
 
-        app.finalize_luna_session_exit(session, 5)
+        controller.notify_exit(session, 5)
 
-        self.assertIsNone(app.get_luna_session())
-        self.assertIsNone(app.cli_process)
-        self.assertFalse(app.is_reading)
-        self.assertIsNone(app.attached_pid)
-        self.assertEqual(app.hooks, {})
+        self.assertIsNone(controller.session)
+        self.assertEqual(exits, [(5, False)])
 
     def test_stale_exit_cannot_clear_newer_session(self):
-        app = gui.SugoiHookGUI.__new__(gui.SugoiHookGUI)
-        app.luna_session_lock = threading.RLock()
         stale = LunaProcessSession(FakeProcess(), 1, 41, "stale.exe")
-        current = LunaProcessSession(FakeProcess(), 2, 42, "current.exe")
+        controller = self.make_controller()
+        current = controller.start(["luna"], 42, "current.exe")
         callback_ran = threading.Event()
-        app.luna_session = current
-        app.cli_process = current.process
-        app.is_reading = True
-        app.luna_exit_callbacks = {stale.generation: [callback_ran.set]}
-        app.attached_pid = 42
+        controller.add_exit_callback(stale, callback_ran.set)
 
-        app.finalize_luna_session_exit(stale, 0)
+        controller.notify_exit(stale, 0)
 
-        self.assertIs(app.get_luna_session(), current)
-        self.assertIs(app.cli_process, current.process)
-        self.assertEqual(app.attached_pid, 42)
+        self.assertIs(controller.session, current)
         self.assertTrue(callback_ran.is_set())
 
     def test_detach_returns_without_waiting_for_process_exit(self):
         release_wait = threading.Event()
         process = FakeProcess(wait_event=release_wait)
-        session = LunaProcessSession(process, 1, 42, "game.exe")
-        app = gui.SugoiHookGUI.__new__(gui.SugoiHookGUI)
-        app.luna_session_lock = threading.RLock()
-        app.luna_session = session
-        app.cli_process = process
-        app.is_reading = True
-        app.luna_exit_callbacks = {}
-        app.attached_pid = 42
-        app.selected_hook_id = "7"
-        app.hooks_lock = threading.Lock()
-        app.hooks = {"7": {"texts": ["line"]}}
-        app.run_on_ui_thread = lambda callback, *args: callback(*args)
+        controller = self.make_controller(process_factory=lambda *args, **kwargs: process)
+        session = controller.start(["luna"], 42, "game.exe")
 
         callback_ran = threading.Event()
         started_at = time.monotonic()
-        app.detach_process(on_complete=callback_ran.set, notify=False)
+        controller.add_exit_callback(session, callback_ran.set)
+        controller.detach(session)
         elapsed = time.monotonic() - started_at
 
         self.assertLess(elapsed, 0.1)
@@ -160,11 +137,18 @@ class LunaProcessSessionTests(unittest.TestCase):
         self.assertFalse(callback_ran.is_set())
         release_wait.set()
         deadline = time.monotonic() + 1.0
-        while app.get_luna_session() is not None and time.monotonic() < deadline:
+        while controller.session is not None and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertIsNone(app.get_luna_session())
-        self.assertIsNone(app.attached_pid)
+        self.assertIsNone(controller.session)
         self.assertTrue(callback_ran.is_set())
+
+    def test_parse_luna_output_line_preserves_console_and_context_fields(self):
+        self.assertEqual(parse_luna_output_line("[Console] attached\n"), ("console", "attached"))
+        self.assertEqual(
+            parse_luna_output_line("[#7|game.exe:EXBWX0@25C880:thread] text\n"),
+            ("hook", ("7", "EXBWX0@25C880", "game.exe:EXBWX0@25C880:thread", "text")),
+        )
+        self.assertIsNone(parse_luna_output_line("unrecognized"))
 
 
 if __name__ == "__main__":

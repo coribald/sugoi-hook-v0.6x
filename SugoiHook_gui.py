@@ -23,6 +23,7 @@ from pathlib import Path
 
 from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_session import LunaProcessSession
+from luna_controller import LunaController, LunaHookTextEvent
 from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
@@ -267,15 +268,10 @@ class SugoiHookGUI:
         self.root.minsize(min_width, min_height)
         
         # State variables
-        self.cli_process = None
-        self.luna_session = None
-        self.luna_session_lock = threading.RLock()
-        self.luna_session_generation = 0
-        self.luna_exit_callbacks = {}
+        self._luna_controller = None
         self.attached_pid = None
         self.hook_registry = HookRegistry()
         self.selected_hook_id = None
-        self.is_reading = False
         self.process_icons = {}
         self.is_fullscreen = False
         
@@ -3948,19 +3944,40 @@ class SugoiHookGUI:
                 self.process_tree.insert('', tk.END, text='', values=(pid, arch, name), 
                                         image=icon if icon else '')
     
+    def _get_luna_controller(self):
+        if getattr(self, '_luna_controller', None) is None:
+            self._luna_controller = LunaController(
+                self._get_hook_registry(), self.run_on_ui_thread,
+                process_factory=subprocess.Popen,
+                output_lock=getattr(self, 'output_processing_lock', None),
+                max_hook_texts=MAX_HOOK_TEXTS,
+                on_console=lambda text: self.append_output(f"[Console] {text}\n", True, False),
+                on_hook_text=self._handle_luna_hook_text,
+                on_hook_discovered=self.add_hook_to_list,
+                on_hook_preview=self.update_hook_preview,
+                on_session_exit=self._handle_luna_session_exit,
+            )
+        return self._luna_controller
+
+    def _handle_luna_hook_text(self, event: LunaHookTextEvent):
+        self.route_hook_output(event.hook_id, event.text, event.event_sequence)
+
+    def _handle_luna_session_exit(self, session, return_code, expected):
+        self.clear_luna_attachment_state()
+        if expected:
+            self.append_event("\n✓ Detached from process\n")
+        else:
+            self.append_event(f"\n⚠️ Luna hook engine exited unexpectedly (code: {return_code}).\n")
+            self.notify_user("Luna hook engine exited unexpectedly.", level='error', timeout_ms=6000)
+
     def get_luna_session(self):
-        with self.luna_session_lock:
-            return self.luna_session
+        return self._get_luna_controller().session
 
     def is_current_luna_session(self, session):
-        with self.luna_session_lock:
-            return self.luna_session is session
+        return self._get_luna_controller().is_current(session)
 
     def send_luna_command(self, command, session=None):
-        target_session = session or self.get_luna_session()
-        if target_session is None or not self.is_current_luna_session(target_session):
-            raise RuntimeError("No active Luna CLI session")
-        target_session.send(command)
+        self._get_luna_controller().send(command, session)
 
     def attach_process(self):
         """Attach to the selected process"""
@@ -4005,32 +4022,13 @@ class SugoiHookGUI:
             # Create process with CREATE_NO_WINDOW flag to hide console
             import ctypes
             CREATE_NO_WINDOW = 0x08000000
-            process = subprocess.Popen(
-                [str(cli_path)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-16-le',
-                errors='ignore',
-                bufsize=1,
-                cwd=str(cli_dir),
-                env=env,
-                creationflags=CREATE_NO_WINDOW
+            session = self._get_luna_controller().start(
+                [str(cli_path)], pid, name,
+                start_workers=False,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding='utf-16-le', errors='ignore', bufsize=1,
+                cwd=str(cli_dir), env=env, creationflags=CREATE_NO_WINDOW,
             )
-            with self.luna_session_lock:
-                self.luna_session_generation += 1
-                session = LunaProcessSession(
-                    process=process,
-                    generation=self.luna_session_generation,
-                    target_pid=int(pid),
-                    process_name=str(name),
-                )
-                self.luna_session = session
-                self.cli_process = process
-                self.is_reading = True
-
-            self.send_luna_command(f"attach -P{pid}", session=session)
             self.attached_pid = pid
             self.status_label.config(text=f"● Attached to {name}", 
                                     foreground=self.colors['success'])
@@ -4039,11 +4037,8 @@ class SugoiHookGUI:
             with self.hooks_lock:
                 self.hooks.clear()
             self.hook_tree.delete(*self.hook_tree.get_children())
+            self._get_luna_controller().start_workers(session)
 
-            threading.Thread(target=self.read_cli_output, args=(session,), name=f"luna-stdout-{session.generation}", daemon=True).start()
-            threading.Thread(target=self.read_luna_stderr, args=(session,), name=f"luna-stderr-{session.generation}", daemon=True).start()
-            threading.Thread(target=self.watch_luna_process, args=(session,), name=f"luna-watch-{session.generation}", daemon=True).start()
-            
             self.append_event(f"✓ Attached to {name} (PID: {pid})\n")
             self.append_event("⏳ Waiting for hooks... Please start the game and click on a dialogue.\n\n")
             self.update_hook_status_panel(f"attached to {name}")
@@ -4254,119 +4249,26 @@ For more information, refer to the Luna Hook documentation and current community
         return None
 
     def read_cli_output(self, session):
-        """Read output from the Luna CLI process."""
-        self.read_luna_output(session)
-    
+        """Compatibility delegate for existing integrations."""
+        self._get_luna_controller().read_output(session)
+
     def read_luna_output(self, session):
-        """Read and parse Luna Hook CLI output"""
-        # Luna Hook CLI format: [#ID|context_info] text
-        pattern = re.compile(r'^\[#(\d+)\|([^\]]+)\] (.*)$')
-        console_pattern = re.compile(r'^\[Console\] (.+)$')
-        
-        process = session.process
-        while self.is_current_luna_session(session) and process.stdout:
-            try:
-                line = process.stdout.readline()
-                if not line:
-                    break
-                
-                line = line.strip()
-                if not line:
-                    continue
-                
-                # Check for console messages
-                console_match = console_pattern.match(line)
-                if console_match:
-                    text_to_process = f"[Console] {console_match.group(1)}\n"
-                    self.append_output(text_to_process, True, False)
-                    continue
-                
-                # Check for hook output
-                match = pattern.match(line)
-                if match:
-                    hook_id = match.group(1)
-                    context_info = match.group(2)
-                    text = match.group(3)
-                    
-                    # Extract hook name from context (last part before .exe)
-                    context_parts = context_info.split(':')
-                    if len(context_parts) >= 2:
-                        # Try to find a meaningful name from the context
-                        thread_name = context_parts[-2] if len(context_parts) > 1 else context_parts[0]
-                    else:
-                        thread_name = "Unknown"
-                    
-                    now = time.monotonic()
-                    with self.output_processing_lock:
-                        is_new_hook, event_sequence = self._get_hook_registry().record_text(
-                            hook_id, thread_name, context_info, text, now, MAX_HOOK_TEXTS
-                        )
-                        self.route_hook_output(hook_id, text, event_sequence)
-                    if is_new_hook:
-                        self.run_on_ui_thread(self.add_hook_to_list, hook_id, thread_name)
-                    
-                    # Store text and update preview
-                    self.run_on_ui_thread(self.update_hook_preview, hook_id, text)
-                
-            except Exception:
-                if self.is_current_luna_session(session) and not session.expected_stop.is_set():
-                    logging.exception("Luna stdout reader failed for generation %s", session.generation)
-                break
+        self._get_luna_controller().read_output(session)
 
     def read_luna_stderr(self, session):
-        process = session.process
-        if process.stderr is None:
-            return
-        try:
-            while True:
-                line = process.stderr.readline()
-                if not line:
-                    return
-                stripped = line.strip()
-                if stripped:
-                    logging.warning("[LUNA STDERR][generation=%s] %s", session.generation, stripped)
-        except Exception:
-            if not session.expected_stop.is_set():
-                logging.exception("Luna stderr reader failed for generation %s", session.generation)
+        self._get_luna_controller().read_stderr(session)
 
     def watch_luna_process(self, session):
-        try:
-            return_code = session.process.wait()
-        except Exception:
-            return_code = session.process.poll()
-        self.notify_luna_session_exit(session, return_code)
+        self._get_luna_controller().watch_process(session)
 
     def notify_luna_session_exit(self, session, return_code):
-        with self.luna_session_lock:
-            if session.exit_notified.is_set():
-                return
-            session.exit_notified.set()
-        self.run_on_ui_thread(self.finalize_luna_session_exit, session, return_code)
+        self._get_luna_controller().notify_exit(session, return_code)
 
     def finalize_luna_session_exit(self, session, return_code):
-        with self.luna_session_lock:
-            callbacks = self.luna_exit_callbacks.pop(session.generation, [])
-            if self.luna_session is not session:
-                for callback in callbacks:
-                    callback()
-                return
-            self.luna_session = None
-            self.cli_process = None
-            self.is_reading = False
-
-        expected = session.expected_stop.is_set()
-        self.clear_luna_attachment_state()
-        if expected:
-            self.append_event("\n✓ Detached from process\n")
-        else:
-            self.append_event(f"\n⚠️ Luna hook engine exited unexpectedly (code: {return_code}).\n")
-            self.notify_user("Luna hook engine exited unexpectedly.", level='error', timeout_ms=6000)
-        for callback in callbacks:
-            callback()
+        self._get_luna_controller()._finalize_exit(session, return_code)
 
     def stop_luna_session(self, session):
-        return_code = session.terminate()
-        self.notify_luna_session_exit(session, return_code)
+        return self._get_luna_controller()._stop_session(session)
     
     def add_hook_to_list(self, hook_id, function):
         """Add a hook to the hook list"""
@@ -4791,23 +4693,16 @@ For more information, refer to the Luna Hook documentation and current community
                 on_complete()
             return
 
-        with self.luna_session_lock:
-            if on_complete:
-                self.luna_exit_callbacks.setdefault(session.generation, []).append(on_complete)
-        first_stop_request = session.request_stop()
+        controller = self._get_luna_controller()
+        if on_complete:
+            controller.add_exit_callback(session, on_complete)
+        first_stop_request = controller.detach(session)
         self.clear_luna_attachment_state()
         if hasattr(self, 'status_label'):
             self.status_label.config(text="● Detaching...", foreground=self.colors['warning'])
         self.update_hook_status_panel("detaching from process")
         if notify:
             self.notify_user("Detaching from process...", level='info')
-        if first_stop_request:
-            threading.Thread(
-                target=self.stop_luna_session,
-                args=(session,),
-                name=f"luna-stop-{session.generation}",
-                daemon=True,
-            ).start()
     
     
     def create_status_bar(self):

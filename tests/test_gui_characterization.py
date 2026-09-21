@@ -234,6 +234,7 @@ class LunaOutputCharacterizationTests(unittest.TestCase):
         app.run_on_ui_thread = lambda callback, *args: callback(*args)
         app.add_hook_to_list = lambda hook_id, name: app.ui_events.append(("new", hook_id, name))
         app.update_hook_preview = lambda hook_id, text: app.ui_events.append(("preview", hook_id, text))
+        app._get_luna_controller()._session = session
 
         app.read_luna_output(session)
 
