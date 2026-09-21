@@ -25,6 +25,7 @@ from json_persistence import JsonPersistenceError, load_json_object, save_json_o
 from luna_session import LunaProcessSession
 from luna_controller import LunaController, LunaHookTextEvent
 from plugin_settings_dialog import PluginSettingsDialog
+from profile_manager_dialog import ProfileManagerDialog
 from output_pipeline import OutputPipeline
 from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
 from plugin_pipeline import PluginPipeline
@@ -2598,6 +2599,69 @@ class SugoiHookGUI:
         return self._get_process_service().launch(exe_path)
     
     def open_profile_manager(self):
+        """Open the extracted profile-manager view."""
+        self.load_game_profiles()
+        ProfileManagerDialog(
+            self.root, self.colors, dict(self.game_profiles),
+            commit=self.commit_game_profiles, launch=self.launch_profile_game,
+            notify=self.notify_user,
+        ).open()
+
+    def launch_profile_game(self, game_id, profile):
+        """Launch a saved game and find its process for the existing attach flow."""
+        exe_path = profile.get('exe_path', '')
+        game_name = profile.get('exe_name', 'game')
+        if not exe_path or not os.path.exists(exe_path):
+            messagebox.showerror("Error", f"Game executable not found:\n{exe_path}\n\nThe game may have been moved or uninstalled.")
+            return False
+        try:
+            self.silent_auto_launch = True
+            self.launch_executable(exe_path)
+            self.append_event(f"🚀 Launching game: {game_name}\n")
+            self.append_event("⏳ Waiting for process to start and auto-hook...\n\n")
+            self.append_event("⏳ Wait around 3-5 seconds after the game is launched then you should see further updates...\n\n")
+
+            def monitor_and_attach():
+                time.sleep(3)
+                for _attempt in range(30):
+                    try:
+                        for proc in psutil.process_iter(['pid', 'exe']):
+                            try:
+                                proc_exe = proc.info.get('exe', '')
+                                if proc_exe and os.path.normpath(proc_exe.lower()) == os.path.normpath(exe_path.lower()):
+                                    pid = proc.info['pid']
+
+                                    def attach_to_game():
+                                        self.refresh_processes()
+                                        for tree_item in self.process_tree.get_children():
+                                            if self.process_tree.item(tree_item)['values'][0] == pid:
+                                                self.process_tree.selection_set(tree_item)
+                                                self.process_tree.see(tree_item)
+                                                break
+
+                                        def perform_attach():
+                                            self.attach_process()
+                                            self.append_event("✓ Game launched and attached successfully!\n")
+                                            self.append_event("⏳ Please start the game and click on a dialogue or two and wait a bit...\n\n")
+                                            self.append_event("⏳ Game hook will automatically be applied after that...\n\n")
+                                        self.root.after(4000, perform_attach)
+
+                                    self.run_on_ui_thread(attach_to_game)
+                                    return
+                            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                                continue
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                self.append_event("⚠️ Could not find game process after 30 seconds.\n   Please attach manually if the application is running.\n\n")
+
+            threading.Thread(target=monitor_and_attach, daemon=True).start()
+            return True
+        except Exception as error:
+            messagebox.showerror("Error", f"Failed to launch game:\n{error}")
+            return False
+
+    def _open_profile_manager_legacy(self):
         """Open game profile management window"""
         # Load profiles
         self.load_game_profiles()
