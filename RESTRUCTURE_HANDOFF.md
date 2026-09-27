@@ -134,8 +134,14 @@ New modules:
   coordinator.
 - `hook_help_dialog.py`: read-only Hook Code Syntax Help window.
 - `main_window.py`: header, scrollable shell, scrollbar lifecycle, responsive
-  selection row, and section placement. Section builders remain coordinator
-  callbacks for now.
+  selection row, and section placement.
+- `main_cards.py` (post-release follow-up): process, hook, plugins, and output
+  card construction plus the status bar and collapsible section-header helper.
+  Builders own Tk layout only; widgets remain assigned to the host coordinator
+  and all actions route back through coordinator methods. The uncalled
+  `create_footer` remnant was removed. `game_profiles` is now a direct
+  `GameProfileStore.profiles`-backed property, eliminating the second writable
+  owner.
 
 The initial main-window commit had a startup ordering bug: wheel routing ran
 before `self.canvas` was published. It was fixed and the commit amended to

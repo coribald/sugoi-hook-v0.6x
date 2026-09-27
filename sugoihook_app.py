@@ -11,7 +11,7 @@ from pathlib import Path
 
 import psutil
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
 import win32gui
 import win32process
@@ -22,6 +22,7 @@ from game_profile_store import GameProfileStore
 from hook_help_dialog import show_hook_help as show_hook_help_dialog
 from hook_registry import HookRegistry
 from luna_controller import LunaController, LunaHookTextEvent
+import main_cards
 from main_window import MainWindowView
 from output_pipeline import OutputPipeline
 from plugin_manager import PluginManager
@@ -146,7 +147,6 @@ class SugoiHookGUI:
         self.config_warnings = []
         
         # Game profiles system
-        self.game_profiles = {}
         self.game_profiles_path = None
         self.current_game_id = None
         self.auto_hook_pending = False
@@ -340,6 +340,14 @@ class SugoiHookGUI:
     plugin_settings = _plugin_state_property('plugin_settings')
     plugin_file_paths = _plugin_state_property('plugin_file_paths')
     plugin_module_names = _plugin_state_property('plugin_module_names')
+
+    def _profile_state_property(name):
+        return property(
+            lambda self: getattr(self._get_game_profile_store(), name),
+            lambda self, value: setattr(self._get_game_profile_store(), name, value),
+        )
+
+    game_profiles = _profile_state_property('profiles')
 
     def run_on_ui_thread(self, callback, *args):
         """Run a callback on the Tk UI thread."""
@@ -1190,11 +1198,7 @@ class SugoiHookGUI:
 
     def commit_game_profiles(self, updated_profiles):
         """Persist a complete profile snapshot, retaining old state on failure."""
-        store = self._get_game_profile_store()
-        store.profiles = self.game_profiles
-        saved = store.commit(updated_profiles)
-        self.game_profiles = store.profiles
-        return saved
+        return self._get_game_profile_store().commit(updated_profiles)
 
     # ==================== END PLUGIN SYSTEM METHODS =============    
     # ==================== GAME PROFILES SYSTEM METHODS =============    
@@ -1209,14 +1213,12 @@ class SugoiHookGUI:
         """Load game profiles from JSON file"""
         store = self._get_game_profile_store()
         store.path = self.game_profiles_path
-        self.game_profiles = store.load()
-        return self.game_profiles
+        return store.load()
 
     def save_game_profiles(self):
         """Save game profiles to JSON file"""
         store = self._get_game_profile_store()
         store.path = self.game_profiles_path
-        store.profiles = self.game_profiles
         return store.save()
 
     def save_hook_profile(self, hook_id=None, hook_code=None):
@@ -1855,20 +1857,7 @@ class SugoiHookGUI:
 
     def create_section_header(self, parent, section_key, title_text, title_style="Title.TLabel"):
         """Create a reusable section header with a left-side collapse toggle."""
-        header_frame = ttk.Frame(parent)
-        header_frame.columnconfigure(1, weight=1)
-
-        toggle_btn = ttk.Button(
-            header_frame,
-            text="▾",
-            style="Disclosure.TButton",
-            command=lambda key=section_key: self.toggle_section(key)
-        )
-        toggle_btn.grid(row=0, column=0, sticky=tk.W, padx=(2, 2))
-        setattr(self, f"{section_key}_toggle_btn", toggle_btn)
-
-        ttk.Label(header_frame, text=title_text, style=title_style).grid(row=0, column=1, sticky=tk.W)
-        return header_frame
+        return main_cards.create_section_header(self, parent, section_key, title_text, title_style)
 
     def toggle_section(self, section_key, collapsed=None):
         """Show or hide a section body and update its disclosure button."""
@@ -1931,343 +1920,15 @@ class SugoiHookGUI:
 
     def create_process_card(self, parent):
         """Create the process selection card"""
-        card = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        self.process_card = card
-        card.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 12), padx=(0, 6))
-        card.columnconfigure(0, weight=1)
-        
-        # Card header
-        header = self.create_section_header(card, 'process', "🎮 1. Select Process")
-        header.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
-        header.columnconfigure(2, weight=0)
-
-        self.process_header_spacer = ttk.Button(
-            header,
-            text="",
-            style="TButton",
-            state='disabled'
-        )
-        self.process_header_spacer.grid(row=0, column=2, sticky=tk.E)
-
-        self.process_body_frame = ttk.Frame(card)
-        self.process_body_frame.grid(row=1, column=0, sticky=(tk.W, tk.E))
-        self.process_body_frame.columnconfigure(0, weight=1)
-        
-        # Toolbar row
-        toolbar_frame = ttk.Frame(self.process_body_frame)
-        toolbar_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
-
-        ttk.Button(toolbar_frame, text="🔄 Refresh", command=self.refresh_processes,
-                  style="Secondary.TButton").pack(side=tk.LEFT, padx=(0, 5))
-
-        ttk.Button(toolbar_frame, text="📂 Browse for EXE", 
-                  command=self.browse_and_attach_exe,
-                  style="Secondary.TButton").pack(side=tk.LEFT, padx=(0, 5))
-
-        ttk.Button(toolbar_frame, text="💾 Game Profiles", 
-                  command=self.open_profile_manager,
-                  style="Secondary.TButton").pack(side=tk.LEFT)
-
-        # Search row
-        search_frame = ttk.Frame(self.process_body_frame)
-        search_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
-        search_frame.columnconfigure(0, weight=1)
-        
-        self.search_var = tk.StringVar()
-        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
-        search_entry.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        search_entry.insert(0, "🔍 Search processes...")
-        search_entry.bind('<FocusIn>', lambda e: search_entry.delete(0, tk.END) if search_entry.get() == "🔍 Search processes..." else None)
-        
-        # Process list
-        list_frame = ttk.Frame(self.process_body_frame)
-        list_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
-        
-        columns = ('pid', 'arch', 'name')
-        self.process_tree = ttk.Treeview(list_frame, columns=columns, show='tree headings', height=3)
-        self.process_tree_default_height = 3
-        self.process_tree.heading('#0', text='')
-        self.process_tree.heading('pid', text='PID')
-        self.process_tree.heading('arch', text='Arch')
-        self.process_tree.heading('name', text='Process Name')
-        
-        self.process_tree.column('#0', width=self.scale(28), anchor='center', stretch=False)
-        self.process_tree.column('pid', width=self.scale(58), minwidth=self.scale(52), anchor='center', stretch=False)
-        self.process_tree.column('arch', width=self.scale(52), minwidth=self.scale(48), anchor='center', stretch=False)
-        self.process_tree.column('name', width=self.scale(320), minwidth=self.scale(180), anchor='w', stretch=True)
-        
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.process_tree.yview)
-        self.process_tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.process_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        
-        # Now set up the search trace after process_tree is created
-        self.search_var.trace('w', lambda *args: self.filter_processes())
-        
-        # Enable double-click to attach
-        self.process_tree.bind('<Double-Button-1>', lambda e: self.attach_process())
-        self.bind_vertical_mousewheel(self.process_tree)
-        
-        # Action buttons
-        action_frame = ttk.Frame(card)
-        action_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
-        action_frame.columnconfigure(0, weight=1)
-
-        self.status_label = ttk.Label(action_frame, text="● Not attached", 
-                                      style="Status.TLabel",
-                                      foreground=self.colors['text_dim'])
-        self.status_label.grid(row=0, column=0, sticky=tk.W)
-
-        self.detach_btn = ttk.Button(
-            action_frame,
-            text="⏹️ Detach",
-            command=self.detach_process,
-            style="Danger.TButton",
-            state='disabled'
-        )
-        self.detach_btn.grid(row=0, column=1, sticky=tk.E, padx=(0, 8))
-
-        self.attach_btn = ttk.Button(
-            action_frame,
-            text="➡️ Attach Selected",
-            command=self.attach_process,
-            style="TButton"
-        )
-        self.attach_btn.grid(row=0, column=2, sticky=tk.E)
+        main_cards.build_process_card(self, parent)
         
     def create_hook_card(self, parent):
         """Create the hook selection card"""
-        card = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        self.hook_card = card
-        card.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 12), padx=(6, 0))
-        card.columnconfigure(0, weight=1)
-        
-        # Card header
-        header_frame = self.create_section_header(card, 'hook', "🎯 2. Select Hook")
-        header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
-        header_frame.columnconfigure(2, weight=0)
-
-        self.select_hook_btn = ttk.Button(
-            header_frame,
-            text="✅ Use Selected Hook",
-            command=self.select_hook,
-            style="TButton",
-            state='disabled'
-        )
-        self.select_hook_btn.grid(row=0, column=2, sticky=tk.E)
-
-        status_frame = ttk.Frame(card)
-        status_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
-        status_frame.columnconfigure(0, weight=1)
-
-        self.hook_status_summary = ttk.Label(
-            status_frame,
-            text="Not attached | Engine: Luna",
-            style="Status.TLabel",
-            foreground=self.colors['text_dim']
-        )
-        self.hook_status_summary.grid(row=0, column=0, sticky=tk.W)
-
-        self.hook_active_label = ttk.Label(
-            status_frame,
-            text="Current hook: none selected",
-            style="Status.TLabel",
-            foreground=self.colors['text_dim']
-        )
-        self.hook_active_label.grid(row=1, column=0, sticky=tk.W)
-
-        self.hook_concat_label = ttk.Label(
-            status_frame,
-            text="Concatenation: inactive",
-            style="Status.TLabel",
-            foreground=self.colors['text_dim']
-        )
-        self.hook_concat_label.grid(row=2, column=0, sticky=tk.W)
-
-        self.hook_profile_label = ttk.Label(
-            status_frame,
-            text="Saved profile: none",
-            style="Status.TLabel",
-            foreground=self.colors['text_dim']
-        )
-        self.hook_profile_label.grid(row=3, column=0, sticky=tk.W)
-
-        self.hook_last_action_label = ttk.Label(
-            status_frame,
-            text="Last action: waiting for attachment",
-            style="Status.TLabel",
-            foreground=self.colors['text_dim']
-        )
-        self.hook_last_action_label.grid(row=4, column=0, sticky=tk.W)
-
-        self.hook_body_frame = ttk.Frame(card)
-        self.hook_body_frame.grid(row=2, column=0, sticky=(tk.W, tk.E))
-        self.hook_body_frame.columnconfigure(0, weight=1)
-        
-        # Hook list
-        list_frame = ttk.Frame(self.hook_body_frame)
-        list_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
-        
-        columns = ('id', 'function', 'preview')
-        self.hook_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=3)
-        self.hook_tree_default_height = 3
-        self.hook_tree.heading('id', text='ID')
-        self.hook_tree.heading('function', text='Function')
-        self.hook_tree.heading('preview', text='Text Preview')
-        
-        self.hook_tree.column('id', width=self.scale(44), minwidth=self.scale(40), anchor='center', stretch=False)
-        self.hook_tree.column('function', width=self.scale(210), minwidth=self.scale(140), anchor='w', stretch=False)
-        self.hook_tree.column('preview', width=self.scale(520), minwidth=self.scale(260), anchor='w', stretch=True)
-        
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.hook_tree.yview)
-        h_scrollbar = ttk.Scrollbar(list_frame, orient=tk.HORIZONTAL, command=self.hook_tree.xview)
-        self.hook_tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=h_scrollbar.set)
-        
-        self.hook_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        h_scrollbar.grid(row=1, column=0, sticky=(tk.W, tk.E))
-        
-        # Enable double-click to select hook
-        self.hook_tree.bind('<Double-Button-1>', lambda e: self.select_hook())
-        self.hook_tree.bind('<Button-3>', self.show_hook_context_menu)
-        self.bind_vertical_mousewheel(self.hook_tree)
-        
-        # Manual hook input section
-        manual_hook_frame = ttk.Frame(self.hook_body_frame)
-        manual_hook_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(8, 0))
-        manual_hook_frame.columnconfigure(1, weight=1)
-        
-        ttk.Label(manual_hook_frame, text="Manual Hook:", 
-                 font=('Segoe UI', 9, 'bold'),
-                 foreground=self.colors['accent']).grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
-        
-        self.manual_hook_entry = ttk.Entry(manual_hook_frame)
-        self.manual_hook_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
-        self.manual_hook_entry.insert(0, "e.g., HB4@0 or HS-4@12345")
-        self.manual_hook_entry.bind('<FocusIn>', lambda e: self.manual_hook_entry.delete(0, tk.END) 
-                                    if self.manual_hook_entry.get().startswith("e.g.,") else None)
-        self.manual_hook_entry.bind('<Return>', lambda e: self.attach_manual_hook())
-        
-        self.attach_manual_hook_btn = ttk.Button(manual_hook_frame, text="🔗 Attach Hook", 
-                                                 command=self.attach_manual_hook,
-                                                 style="Secondary.TButton",
-                                                 state='disabled')
-        self.attach_manual_hook_btn.grid(row=0, column=2)
-        
-        # Help button for hook syntax
-        help_btn = ttk.Button(manual_hook_frame, text="❓", 
-                             command=self.show_hook_help,
-                             style="Secondary.TButton",
-                             width=3)
-        help_btn.grid(row=0, column=3, padx=(5, 0))
-
-        self.hook_tree.bind('<<TreeviewSelect>>', lambda e: self.update_hook_action_state())
-        self.update_hook_status_panel()
-        self.update_hook_action_state()
+        main_cards.build_hook_card(self, parent)
         
     def create_plugins_card(self, parent):
         """Create the plugins management card"""
-        card = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        card.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
-        card.columnconfigure(0, weight=1)
-        
-        # Card header
-        header_frame = self.create_section_header(card, 'plugins', "🔌 Plugins")
-        header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
-        
-        # Plugin action buttons
-        btn_frame = ttk.Frame(header_frame)
-        btn_frame.grid(row=0, column=2, sticky=tk.E)
-        
-        # Show active plugins count
-        self.plugins_count_label = ttk.Label(btn_frame, 
-                                             text=f"Active: {len(self.active_plugins)} plugins",
-                                             style="Status.TLabel",
-                                             foreground=self.colors['text_dim'])
-        self.plugins_count_label.pack(side=tk.LEFT, padx=(0, 10))
-        
-        
-        ttk.Button(btn_frame, text="📂 Open Folder", 
-                  command=self.open_plugins_folder,
-                  style="Secondary.TButton").pack(side=tk.LEFT, padx=(0, 5))
-        
-        ttk.Button(btn_frame, text="🔄 Refresh", 
-                  command=self.reload_plugins,
-                  style="Secondary.TButton").pack(side=tk.LEFT)
-        
-        self.plugins_body_frame = ttk.Frame(card)
-        self.plugins_body_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.plugins_body_frame.columnconfigure(0, weight=1)
-
-        controls_frame = ttk.Frame(self.plugins_body_frame)
-        controls_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
-
-        self.plugin_toggle_btn = ttk.Button(controls_frame, text="Toggle Active", command=self.toggle_selected_plugin, style="Secondary.TButton")
-        self.plugin_toggle_btn.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.plugin_configure_btn = ttk.Button(controls_frame, text="Configure", command=self.configure_selected_plugin, style="Secondary.TButton")
-        self.plugin_configure_btn.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.plugin_move_up_btn = ttk.Button(controls_frame, text="Move Up", command=lambda: self.move_selected_plugin(-1), style="Secondary.TButton")
-        self.plugin_move_up_btn.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.plugin_move_down_btn = ttk.Button(controls_frame, text="Move Down", command=lambda: self.move_selected_plugin(1), style="Secondary.TButton")
-        self.plugin_move_down_btn.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.plugin_controls_hint = ttk.Label(controls_frame, text="Tip: Use buttons for precise ordering. Drag still works.", style="Status.TLabel", foreground=self.colors['text_dim'])
-        self.plugin_controls_hint.pack(side=tk.RIGHT)
-
-        # Plugins list
-        list_frame = ttk.Frame(self.plugins_body_frame)
-        list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
-        
-        columns = ('status', 'name', 'version', 'description', 'actions')
-        self.plugins_tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=7)
-        self.plugins_tree.heading('status', text='Status')
-        self.plugins_tree.heading('name', text='Plugin Name')
-        self.plugins_tree.heading('version', text='Version')
-        self.plugins_tree.heading('description', text='Description')
-        self.plugins_tree.heading('actions', text='Actions')
-        
-        self.plugins_tree.column('status', width=self.scale(80), minwidth=self.scale(80), anchor='center', stretch=False)
-        self.plugins_tree.column('name', width=self.scale(150), minwidth=self.scale(120), anchor='center', stretch=False)
-        self.plugins_tree.column('version', width=self.scale(60), minwidth=self.scale(50), anchor='center', stretch=False)
-        self.plugins_tree.column('description', width=self.scale(350), minwidth=self.scale(180), anchor='center', stretch=True)
-        self.plugins_tree.column('actions', width=self.scale(100), minwidth=self.scale(100), anchor='center', stretch=False)
-        
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.plugins_tree.yview)
-        self.plugins_tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.plugins_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        
-        # Enable double-click to toggle plugin
-        self.plugins_tree.bind('<Double-Button-1>', lambda e: self.toggle_selected_plugin())
-        
-        # Enable single-click on Actions column for configure button
-        self.plugins_tree.bind('<Button-1>', self.on_plugin_click)
-        
-        # Enable right-click context menu
-        self.plugins_tree.bind('<Button-3>', self.show_plugin_context_menu)
-        
-        # Enable Drag and Drop for reordering
-        self.plugins_tree.bind('<B1-Motion>', self.on_plugin_drag_motion)
-        self.plugins_tree.bind('<ButtonRelease-1>', self.on_plugin_drag_release)
-        
-        self.plugins_tree.bind('<<TreeviewSelect>>', lambda e: self.update_plugin_action_buttons())
-        self.bind_vertical_mousewheel(self.plugins_tree)
-
-        # Populate the plugins list
-        self.refresh_plugins_list()
-        self.toggle_section('plugins', self.plugins_section_collapsed)
-        self.update_plugin_action_buttons()
+        main_cards.build_plugins_card(self, parent)
     
     def on_plugin_click(self, event):
         """Handle clicks on plugin tree, especially on Actions column"""
@@ -2358,106 +2019,8 @@ class SugoiHookGUI:
     
     def create_output_card(self, parent):
         """Create the text output card"""
-        card = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        card.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 15))
-        card.columnconfigure(0, weight=1)
-        card.rowconfigure(1, weight=1)
-        
-        # Card header
-        header_frame = self.create_section_header(card, 'output', "📝 Session Output")
-        header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
-        
-        # Action buttons
-        action_frame = ttk.Frame(header_frame)
-        action_frame.grid(row=0, column=2, sticky=tk.E)
-        
-        ttk.Button(action_frame, text="💾 Save to File", 
-                  command=self.save_to_file,
-                  style="Secondary.TButton").pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(action_frame, text="🗑️ Clear", 
-                  command=self.clear_output,
-                  style="Secondary.TButton").pack(side=tk.LEFT)
-        
-        self.output_body_frame = ttk.Frame(card)
-        self.output_body_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.output_body_frame.columnconfigure(0, weight=1)
-        self.output_body_frame.rowconfigure(1, weight=1)
-        self.output_body_frame.rowconfigure(3, weight=1)
+        main_cards.build_output_card(self, parent)
 
-        events_header = self.create_section_header(self.output_body_frame, 'events', "Session Events", title_style="Status.TLabel")
-        events_header.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
-
-        self.events_body_frame = ttk.Frame(self.output_body_frame)
-        self.events_body_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        self.events_body_frame.columnconfigure(0, weight=1)
-        self.events_body_frame.rowconfigure(0, weight=1)
-
-        self.event_text = tk.Text(
-            self.events_body_frame,
-            wrap=tk.WORD,
-            bg=self.colors['bg'],
-            fg=self.colors['text_dim'],
-            insertbackground=self.colors['primary'],
-            selectbackground=self.colors['primary'],
-            selectforeground=self.colors['bg'],
-            font=('Consolas', 9),
-            borderwidth=0,
-            padx=10,
-            pady=8,
-            state='disabled',
-            height=1
-        )
-        self.event_scrollbar = ttk.Scrollbar(self.events_body_frame, orient=tk.VERTICAL, command=self.event_text.yview)
-        self.event_text.configure(yscrollcommand=self.event_scrollbar.set)
-        self.event_text.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        self.event_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.event_scrollbar.grid_remove()
-        self.event_text_default_height = 1
-        self.bind_vertical_mousewheel(self.event_text)
-
-        extracted_header = self.create_section_header(self.output_body_frame, 'extracted', "Extracted Text", title_style="Status.TLabel")
-        extracted_header.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
-
-        self.extracted_body_frame = ttk.Frame(self.output_body_frame)
-        self.extracted_body_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.extracted_body_frame.columnconfigure(0, weight=1)
-        self.extracted_body_frame.rowconfigure(0, weight=1)
-
-        self.output_text = scrolledtext.ScrolledText(
-            self.extracted_body_frame, wrap=tk.WORD,
-            bg=self.colors['bg'],
-            fg=self.colors['fg'],
-            insertbackground=self.colors['primary'],
-            selectbackground=self.colors['primary'],
-            selectforeground=self.colors['bg'],
-            font=('Consolas', 10),
-            borderwidth=0,
-            padx=10, pady=10,
-            state='disabled',
-            height=8
-        )
-        self.output_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.output_text_default_height = 8
-        self.bind_vertical_mousewheel(self.output_text)
-
-    def create_footer(self, parent):
-        """Create the footer with action buttons"""
-        footer = ttk.Frame(parent)
-        footer.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(5,0))
-        
-        ttk.Button(footer, text="🗑️ Clear", command=self.clear_output,
-                  style="Secondary.TButton").pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.detach_btn = ttk.Button(footer, text="⏹️ Detach", 
-                                     command=self.detach_process, 
-                                     style="Danger.TButton",
-                                     state='disabled')
-        self.detach_btn.pack(side=tk.LEFT)
-        
-        if TRAY_AVAILABLE:
-            ttk.Button(footer, text="🔽 Minimize to Tray", command=self.hide_to_tray,
-                      style="Secondary.TButton").pack(side=tk.RIGHT)
-        
     def should_exclude_process(self, proc_name, proc_path=None):
         """
         Advanced filtering to exclude system processes and bloatware
@@ -3234,41 +2797,7 @@ class SugoiHookGUI:
     
     def create_status_bar(self):
         """Create status bar with statistics and transient notices."""
-        status_frame = ttk.Frame(self.root, style="Card.TFrame", padding=(10, 5))
-        status_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=15, pady=(5, 10))
-        
-        self.status_conn_label = ttk.Label(status_frame, text="● Disconnected", 
-                                           style="Status.TLabel",
-                                           foreground=self.colors['text_dim'])
-        self.status_conn_label.pack(side=tk.LEFT, padx=(0, 20))
-        
-        self.status_lines_label = ttk.Label(status_frame, text="Lines: 0", style="Status.TLabel")
-        self.status_lines_label.pack(side=tk.LEFT, padx=(0, 15))
-        
-        self.status_words_label = ttk.Label(status_frame, text="Words: 0", style="Status.TLabel")
-        self.status_words_label.pack(side=tk.LEFT, padx=(0, 15))
-        
-        self.status_chars_label = ttk.Label(status_frame, text="Characters: 0", style="Status.TLabel")
-        self.status_chars_label.pack(side=tk.LEFT, padx=(0, 15))
-        
-        self.status_rate_label = ttk.Label(status_frame, text="Rate: 0 c/s", style="Status.TLabel")
-        self.status_rate_label.pack(side=tk.LEFT)
-
-        if TRAY_AVAILABLE:
-            ttk.Button(
-                status_frame,
-                text="🔽 Minimize to Tray",
-                command=self.hide_to_tray,
-                style="Secondary.TButton"
-            ).pack(side=tk.RIGHT)
-
-        self.status_notice_label = ttk.Label(
-            status_frame,
-            text="Ready",
-            style="Status.TLabel",
-            foreground=self.colors['text_dim']
-        )
-        self.status_notice_label.pack(side=tk.RIGHT, padx=(15, 10))
+        main_cards.build_status_bar(self, TRAY_AVAILABLE)
 
     def update_status_bar(self):
         """Update status bar with current statistics"""

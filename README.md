@@ -297,6 +297,7 @@ sugoi-hook/
 ├── luna_session.py
 ├── luna_controller.py
 ├── main_window.py
+├── main_cards.py
 ├── plugin_settings_dialog.py
 ├── profile_manager_dialog.py
 ├── hook_help_dialog.py
