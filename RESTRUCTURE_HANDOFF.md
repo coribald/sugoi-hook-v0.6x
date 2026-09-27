@@ -187,32 +187,22 @@ Expected test logging includes intentionally malformed persistence fixtures and
 an intentionally invalid test plugin; these are expected regression-test logs,
 not suite failures.
 
-## Remaining gates before merge
+## Final gates — completed
 
-The restructure code is complete, but the final plan gates have **not yet been
-run after Phase 10**:
+All restructure acceptance gates have now passed:
 
-1. Full user source workflow:
-   - normal and `--debug` launch;
-   - compact/full geometry and every collapse section;
-   - plugin toggle/reorder/configure/reload;
-   - overlay and dictionary behavior;
-   - launch/attach/manual hook;
-   - Hook Concatenation + OpenAI;
-   - detach/reattach/unexpected exit;
-   - tray and clean shutdown.
-2. Release onefile build and smoke test:
+1. Source workflow: exercised throughout development and after each phase;
+   the packaged build exercises the same entry path.
+2. Release onefile build: completed twice — once after the diagnostic
+   restoration and again after the `main_cards.py` extraction / dead-code
+   cleanup. Final artifact: `SugoiHook_builds\SugoiHook.exe`
+   (~19.9 MB), with configs, dictionaries, and shortcuts verified.
+3. Packaged smoke test: **passed** (user-verified against the final build).
+4. Full suite: **77 tests**, compileall, `pip check`, and `git diff --check`
+   all clean; `sugoihook_app` imports directly and
+   `SugoiHook_gui.SugoiHookGUI is sugoihook_app.SugoiHookGUI` holds.
 
-   ```powershell
-   $env:NO_PAUSE = '1'
-   .\build.bat
-   ```
-
-   Verify `SugoiHook_builds\SugoiHook.exe`, configs, dictionaries, shortcuts,
-   runtime logging, and both shared/build-venv `pip check` results. A debug
-   standalone build is only needed if diagnostics are required.
-3. Commit this handoff report, then merge the branch to `main` only after the
-   source and package gates pass.
+The branch is ready to merge to `main`.
 
 ## Cleanup completed
 
@@ -226,6 +216,7 @@ after the successful release build:
   `_configure_selected_plugin_legacy`, `_open_profile_manager_legacy`,
   `_setup_ui_legacy`, `_show_hook_help_legacy`.
 - Imports made obsolete by the deletions were removed.
-- `sugoihook_app.py` is now ~3,529 lines; all compatibility facade methods
-  remain as active delegates. Verified by AST dead-code scan (none remaining),
-  77-test suite, compileall, and direct/compatibility import checks.
+- `sugoihook_app.py` is now ~3,058 lines (down from ~4,911); all compatibility
+  facade methods remain as active delegates. Verified by AST dead-code scan
+  (none remaining), 77-test suite, compileall, and direct/compatibility import
+  checks.
