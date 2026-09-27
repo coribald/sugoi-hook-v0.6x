@@ -169,7 +169,7 @@ main loop successfully in the source-launch smoke test.
 
 Latest automated validation on `afcdc74`:
 
-- `python -m unittest discover -s tests -v`: **74 tests passed**.
+- `python -m unittest discover -s tests -v`: **77 tests passed**.
 - Explicit top-level-module plus `plugins`, `deep_translator`, and `tests`
   compilation passed. (Do not use literal `*.py` with PowerShell;
   `compileall` reports it as a non-expandable path.)
@@ -208,11 +208,18 @@ run after Phase 10**:
 3. Commit this handoff report, then merge the branch to `main` only after the
    source and package gates pass.
 
-## Known cleanup note
+## Cleanup completed
 
-Several earlier extraction phases intentionally left renamed private
-`*_legacy` GUI methods behind after routing production behavior through the
-new module. They are unreachable compatibility residue, not active execution
-paths. Do not delete them during a live/package gate; delete them only in a
-separate, search-backed cleanup commit after confirming no compatibility caller
-depends on them.
+Unreachable compatibility residue has been removed in a search-backed cleanup
+after the successful release build:
+
+- Dead method bodies after unconditional delegate returns were deleted from
+  `sugoihook_app.py` (plugin lifecycle, output-bundle preparation/completion,
+  plugin settings persistence, game profiles, and process filtering).
+- Four private `*_legacy` methods with zero callers were deleted:
+  `_configure_selected_plugin_legacy`, `_open_profile_manager_legacy`,
+  `_setup_ui_legacy`, `_show_hook_help_legacy`.
+- Imports made obsolete by the deletions were removed.
+- `sugoihook_app.py` is now ~3,529 lines; all compatibility facade methods
+  remain as active delegates. Verified by AST dead-code scan (none remaining),
+  77-test suite, compileall, and direct/compatibility import checks.

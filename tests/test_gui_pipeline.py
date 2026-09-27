@@ -35,8 +35,26 @@ class TranslationProbe:
     enabled = True
     is_translation_plugin = True
 
+    def __init__(self, translated="Translated line"):
+        self.translated = translated
+
     def should_translate_text(self, text):
         return not text.startswith("[Console]")
+
+    def translate_text(self, text):
+        return self.translated
+
+
+class DropPlugin:
+    name = "Drop"
+    enabled = True
+    is_translation_plugin = False
+
+    def process_text(self, text):
+        return None
+
+    def process_clipboard_text(self, text):
+        return None
 
 
 class FallbackTranslationProbe:
@@ -64,6 +82,74 @@ class GuiPipelineRegressionTests(unittest.TestCase):
         self.assertEqual(prepared["translator_input"], "台詞")
         self.assertEqual(probe.display_calls, 1)
         self.assertEqual(probe.clipboard_calls, 1)
+
+    def test_pipeline_emits_detailed_stage_diagnostics(self):
+        pre = ProbePlugin(display="Clean source\n", clipboard="Clipboard source\n")
+        translator = TranslationProbe("English result")
+        post = ProbePlugin(display="Final display\n")
+        app = self.make_app(
+            {"pre.py": pre, "translator.py": translator, "post.py": post},
+            ["pre.py", "translator.py", "post.py"],
+        )
+        diagnostics = []
+        app.log_pipeline = lambda stage, **fields: diagnostics.append((stage, fields))
+
+        prepared = app.prepare_plugin_output_bundle("Raw source\n", True)
+        completed = app.complete_plugin_output_bundle(prepared)
+
+        self.assertEqual(completed, ("Final display\n", "Clipboard source"))
+        stages = [stage for stage, _fields in diagnostics]
+        self.assertEqual(stages, [
+            "pre_translation.start",
+            "pre_translation.plugin_result",
+            "pre_translation.clipboard_plugin_result",
+            "pre_translation.complete",
+            "bundle.prepared",
+            "translation.request",
+            "translation.result",
+            "bundle.translation_phase_complete",
+            "post_translation.plugin_result",
+            "output.summary",
+        ])
+        self.assertEqual(diagnostics[4][1]["translator_input"], "Clean source")
+        self.assertEqual(diagnostics[5][1]["clipboard_source"], "Clipboard source")
+        self.assertEqual(diagnostics[-1][1]["output_window_text"], "Final display\n")
+
+    def test_pipeline_logs_empty_translation_and_post_drop(self):
+        translator = TranslationProbe("")
+        post = DropPlugin()
+        app = self.make_app(
+            {"translator.py": translator, "post.py": post},
+            ["translator.py", "post.py"],
+        )
+        diagnostics = []
+        app.log_pipeline = lambda stage, **fields: diagnostics.append((stage, fields))
+
+        prepared = app.prepare_plugin_output_bundle("Source\n", False)
+        completed = app.complete_plugin_output_bundle(prepared)
+
+        self.assertEqual(completed, (None, None))
+        stages = [stage for stage, _fields in diagnostics]
+        self.assertIn("translation.empty", stages)
+        self.assertIn("bundle.translation_phase_complete", stages)
+        self.assertIn("post_translation.plugin_dropped", stages)
+        self.assertNotIn("output.summary", stages)
+
+    def test_pipeline_logs_display_and_clipboard_drops(self):
+        drop = DropPlugin()
+        app = self.make_app({"drop.py": drop}, ["drop.py"])
+        diagnostics = []
+        app.log_pipeline = lambda stage, **fields: diagnostics.append((stage, fields))
+
+        prepared = app.prepare_plugin_output_bundle("Dropped source\n", False)
+
+        self.assertIsNone(prepared)
+        self.assertEqual([stage for stage, _fields in diagnostics], [
+            "pre_translation.start",
+            "pre_translation.plugin_dropped",
+            "pre_translation.clipboard_plugin_dropped",
+            "bundle.dropped_pre_translation",
+        ])
 
     def test_console_output_does_not_enter_latest_only_translation(self):
         translator = TranslationProbe()

@@ -1,24 +1,18 @@
 """Application coordinator composition root."""
 
 import copy
-import ctypes
-import hashlib
-import importlib.util
 import logging
 import os
-import re
 import subprocess
 import sys
 import threading
 import time
-import types
 from pathlib import Path
 
 import psutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from PIL import Image, ImageDraw, ImageTk
-import win32con
 import win32gui
 import win32process
 import win32ui
@@ -27,12 +21,10 @@ from config_validation import is_valid_game_profiles, is_valid_plugins_config
 from game_profile_store import GameProfileStore
 from hook_help_dialog import show_hook_help as show_hook_help_dialog
 from hook_registry import HookRegistry
-from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_controller import LunaController, LunaHookTextEvent
-from luna_session import LunaProcessSession
 from main_window import MainWindowView
 from output_pipeline import OutputPipeline
-from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
+from plugin_manager import PluginManager
 from plugin_pipeline import PluginPipeline
 from plugin_settings_dialog import PluginSettingsDialog
 from process_service import ProcessService, windows_process_architecture
@@ -402,137 +394,18 @@ class SugoiHookGUI:
         if not PLUGINS_AVAILABLE:
             return
         return self._sync_plugin_manager_context().init()
-        # Ensure writable custom plugins folder exists regardless of bundled plugin layout
-        if not self.plugins_folder.exists():
-            self.plugins_folder.mkdir(parents=True, exist_ok=True)
-            
-        if not PLUGINS_AVAILABLE:
-            return
-        
-        # Load saved plugin configuration
-        self.load_plugins_config()
-        
-        # Discover and load available plugins
-        self.discover_plugins()
     
     def discover_plugins(self):
         """Discover all available plugins in the plugins folder"""
         return self._sync_plugin_manager_context().discover()
-        plugin_search_paths = []
-        if self.bundled_plugins_folder and self.bundled_plugins_folder.exists():
-            plugin_search_paths.append(self.bundled_plugins_folder)
-        if self.plugins_folder and self.plugins_folder.exists() and self.plugins_folder not in plugin_search_paths:
-            plugin_search_paths.append(self.plugins_folder)
-
-        if not plugin_search_paths:
-            return
-        
-        current_files = set()
-        for plugin_dir in plugin_search_paths:
-            for plugin_file in plugin_dir.glob("*.py"):
-                # Skip __init__.py and other special files
-                if plugin_file.name.startswith("_"):
-                    continue
-                
-                current_files.add(plugin_file.name)
-                
-                try:
-                    if runtime_debug_logging_enabled():
-                        logging.info('Discovering plugin file: %s', plugin_file)
-                    plugin = self.load_plugin(plugin_file)
-                    # Apply saved settings to the plugin
-                    if plugin:
-                        if runtime_debug_logging_enabled():
-                            logging.info('Loaded plugin: %s (%s)', plugin_file.name, getattr(plugin, 'name', plugin_file.stem))
-                    else:
-                        logging.warning('Plugin returned no instance: %s', plugin_file.name)
-
-                    if plugin and plugin_file.name in self.plugin_settings:
-                        self.apply_plugin_settings(
-                            plugin_file.name,
-                            plugin,
-                            dict(self.plugin_settings[plugin_file.name]),
-                        )
-                    
-                    # If this plugin was previously active, enable it
-                    if plugin and plugin_file.name in self.active_plugins:
-                        plugin.enabled = True
-                        plugin.on_enable()
-                except Exception:
-                    logging.exception('Failed to discover plugin: %s', plugin_file)
-
-        for filename in list(self.plugins):
-            if filename not in current_files:
-                self.unload_plugin(filename)
-        
-        # Clean up active_plugins list - remove any that weren't found
-        self.active_plugins = [p for p in self.active_plugins if p in self.plugins]
-        self.plugin_file_paths = {
-            filename: path for filename, path in self.plugin_file_paths.items()
-            if filename in current_files
-        }
-        
-        # Update plugin_order
-        # 1. Remove files that no longer exist
-        self.plugin_order = [p for p in self.plugin_order if p in self.plugins]
-        # 2. Add new files that aren't in the order list yet
-        for filename in self.plugins:
-            if filename not in self.plugin_order:
-                self.plugin_order.append(filename)
-        
-        # Save the updated configuration
-        self.save_plugins_config()
 
     def load_plugins_config(self):
         """Load plugin configuration from JSON file"""
         return self._sync_plugin_manager_context().load_config()
-        self.active_plugins = []
-        self.plugin_order = []
-        self.plugin_settings = {}
-        
-        if not self.plugins_config_path:
-            return
-        try:
-            config, recovered_from_backup = load_json_object(
-                self.plugins_config_path, is_valid_plugins_config
-            )
-        except JsonPersistenceError as error:
-            self.report_config_issue(self.plugins_config_path, error)
-            return
-        if config is None:
-            return
-        if recovered_from_backup:
-            self.report_config_issue(
-                self.plugins_config_path,
-                "the primary file was invalid; recovered the last valid saved settings",
-            )
-        self.active_plugins = config.get('active_plugins', [])
-        self.plugin_order = config.get('plugin_order', [])
-        self.plugin_settings = config.get('plugin_settings', {})
-        self.window_geometry = config.get('window_geometry')
-        self.compact_window_geometry = config.get('compact_window_geometry')
     
     def save_plugins_config(self):
         """Save plugin configuration to JSON file"""
         return self._sync_plugin_manager_context().save_config()
-        if not self.plugins_config_path:
-            return False
-        # Ensure plugin_order reflects all known plugins if empty
-        if not self.plugin_order:
-            self.plugin_order = sorted(list(self.plugins.keys()))
-        config = {
-            'active_plugins': self.active_plugins,
-            'plugin_order': self.plugin_order,
-            'plugin_settings': self.plugin_settings,
-            'window_geometry': self.window_geometry,
-            'compact_window_geometry': self.compact_window_geometry,
-        }
-        try:
-            save_json_object_atomic(self.plugins_config_path, config, is_valid_plugins_config)
-            return True
-        except JsonPersistenceError as error:
-            self.report_config_issue(self.plugins_config_path, error)
-            return False
 
     def report_config_issue(self, path, error):
         message = f"Could not use saved settings in {Path(path).name}: {error}"
@@ -845,145 +718,26 @@ class SugoiHookGUI:
         if not PLUGINS_AVAILABLE:
             return None
         return self._sync_plugin_manager_context().load(plugin_path)
-        if not PLUGINS_AVAILABLE:
-            return None
-        plugin_path = Path(plugin_path)
-        module_name = self.get_plugin_module_name(plugin_path)
-        try:
-            self.unload_plugin(plugin_path.name)
-            self.ensure_dynamic_plugin_package()
-            spec = importlib.util.spec_from_file_location(module_name, plugin_path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f'Could not create an import specification for {plugin_path}')
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-            
-            # Look for a 'plugin' instance or a class that inherits from HookPlugin
-            plugin_instance = None
-            
-            if hasattr(module, 'plugin'):
-                plugin_instance = module.plugin
-            else:
-                # Look for a class that inherits from HookPlugin
-                for attr_name in dir(module):
-                    attr = getattr(module, attr_name)
-                    if (isinstance(attr, type) and 
-                        issubclass(attr, HookPlugin) and 
-                        attr is not HookPlugin):
-                        plugin_instance = attr()
-                        break
-            
-            if plugin_instance is not None:
-                if not isinstance(plugin_instance, HookPlugin):
-                    raise TypeError(f"module.plugin must be a HookPlugin, got {type(plugin_instance).__name__}")
-                plugin_instance.app = self
-                self.plugins[plugin_path.name] = plugin_instance
-                self.plugin_file_paths[plugin_path.name] = plugin_path
-                self.plugin_module_names[plugin_path.name] = module_name
-                return plugin_instance
-            raise TypeError("plugin module did not provide a HookPlugin instance")
-        except Exception:
-            sys.modules.pop(module_name, None)
-            logging.exception('Failed to load plugin from %s', plugin_path)
-        return None
 
     def ensure_dynamic_plugin_package(self):
         """Create the private namespace that owns dynamically loaded plugins."""
         return self.plugin_manager._ensure_package()
-        package = sys.modules.get(DYNAMIC_PLUGIN_PACKAGE)
-        if package is None:
-            package = types.ModuleType(DYNAMIC_PLUGIN_PACKAGE)
-            package.__path__ = []
-            sys.modules[DYNAMIC_PLUGIN_PACKAGE] = package
 
     def get_plugin_module_name(self, plugin_path):
         return self.plugin_manager.module_name(plugin_path)
-        resolved_path = str(Path(plugin_path).resolve()).casefold()
-        safe_stem = re.sub(r'\W+', '_', Path(plugin_path).stem).strip('_') or 'plugin'
-        path_hash = hashlib.sha256(resolved_path.encode('utf-8')).hexdigest()[:16]
-        return f"{DYNAMIC_PLUGIN_PACKAGE}.{safe_stem}_{path_hash}"
 
     def unload_plugin(self, plugin_filename):
         """Disable one plugin and remove only its tracked dynamic module."""
         return self.plugin_manager.unload(plugin_filename)
-        plugin = self.plugins.get(plugin_filename)
-        if plugin is not None:
-            try:
-                plugin.enabled = False
-            except Exception:
-                logging.exception('Failed to mark plugin disabled during unload: %s', plugin_filename)
-            try:
-                plugin.on_disable()
-            except Exception:
-                logging.exception('Failed to disable plugin during unload: %s', plugin_filename)
-        self.plugins.pop(plugin_filename, None)
-        self.plugin_file_paths.pop(plugin_filename, None)
-        module_name = self.plugin_module_names.pop(plugin_filename, None)
-        if module_name:
-            sys.modules.pop(module_name, None)
     
     
     def activate_plugin(self, plugin_filename):
         """Activate a plugin"""
         return self._sync_plugin_manager_context().activate(plugin_filename)
-        with self.output_processing_lock:
-            if plugin_filename in self.plugins and plugin_filename not in self.active_plugins:
-                self.active_plugins.append(plugin_filename)
-                plugin = self.plugins[plugin_filename]
-                try:
-                    plugin.enabled = True
-                    plugin.on_enable()
-                except Exception:
-                    logging.exception('Failed to enable plugin: %s', plugin_filename)
-                    self.active_plugins.remove(plugin_filename)
-                    try:
-                        plugin.enabled = False
-                        plugin.on_disable()
-                    except Exception:
-                        logging.exception('Failed to clean up plugin after enable failure: %s', plugin_filename)
-                    return False
-                if self.save_plugins_config():
-                    return True
-                self.active_plugins.remove(plugin_filename)
-                try:
-                    plugin.enabled = False
-                    plugin.on_disable()
-                except Exception:
-                    logging.exception('Failed to disable plugin after config save failure: %s', plugin_filename)
-        return False
     
     def deactivate_plugin(self, plugin_filename):
         """Deactivate a plugin"""
         return self._sync_plugin_manager_context().deactivate(plugin_filename)
-        with self.output_processing_lock:
-            if plugin_filename in self.active_plugins:
-                active_index = self.active_plugins.index(plugin_filename)
-                self.active_plugins.remove(plugin_filename)
-                if plugin_filename in self.plugins:
-                    plugin = self.plugins[plugin_filename]
-                    try:
-                        plugin.enabled = False
-                        plugin.on_disable()
-                    except Exception:
-                        logging.exception('Failed to disable plugin: %s', plugin_filename)
-                        self.active_plugins.insert(active_index, plugin_filename)
-                        try:
-                            plugin.enabled = True
-                            plugin.on_enable()
-                        except Exception:
-                            logging.exception('Failed to restore plugin after disable failure: %s', plugin_filename)
-                        return False
-                if self.save_plugins_config():
-                    return True
-                self.active_plugins.insert(active_index, plugin_filename)
-                if plugin_filename in self.plugins:
-                    try:
-                        plugin.enabled = True
-                        plugin.on_enable()
-                    except Exception:
-                        logging.exception('Failed to restore plugin after config save failure: %s', plugin_filename)
-        return False
 
     def _pipeline_preview(self, value, limit=180):
         """Return a compact one-line preview for pipeline logging."""
@@ -1020,195 +774,28 @@ class SugoiHookGUI:
     def shutdown_plugin_instances(self):
         """Run plugin teardown and clear dynamically loaded plugin modules."""
         return self.plugin_manager.shutdown()
-        plugin_filenames = list(self.plugins.keys())
-
-        for plugin_filename in plugin_filenames:
-            self.unload_plugin(plugin_filename)
-
-        self.active_plugins = []
 
     
     def run_pre_translation_plugins(self, text):
         """Run the shared pre-translation plugin pipeline and collect later phases."""
         return self._get_plugin_pipeline().run_pre_translation(text)
-        if not PLUGINS_AVAILABLE:
-            return text, text, [], []
-
-        current_text = text
-        clipboard_text = text
-        translation_plugins = []
-        post_translation_plugins = []
-        translation_phase_started = False
-
-        execution_order = [p for p in self.plugin_order if p in self.active_plugins]
-        self.log_pipeline('pre_translation.start', incoming=text, active_plugins=execution_order)
-
-        for plugin_filename in execution_order:
-            if plugin_filename in self.plugins:
-                plugin = self.plugins[plugin_filename]
-                if not plugin.enabled:
-                    continue
-
-                if getattr(plugin, 'is_translation_plugin', False):
-                    translation_phase_started = True
-                    translation_plugins.append(plugin)
-                    continue
-
-                if translation_phase_started:
-                    post_translation_plugins.append(plugin)
-                    continue
-
-                try:
-                    if current_text is not None:
-                        display_result = plugin.process_text(current_text)
-                        if display_result is None:
-                            self.log_pipeline('pre_translation.plugin_dropped', plugin=plugin_filename, incoming=current_text)
-                        else:
-                            self.log_pipeline('pre_translation.plugin_result', plugin=plugin_filename, output=display_result)
-                        current_text = display_result
-
-                    if clipboard_text is not None:
-                        clipboard_result = plugin.process_clipboard_text(clipboard_text)
-                        if clipboard_result is None:
-                            self.log_pipeline('pre_translation.clipboard_plugin_dropped', plugin=plugin_filename, incoming=clipboard_text)
-                        else:
-                            self.log_pipeline('pre_translation.clipboard_plugin_result', plugin=plugin_filename, output=clipboard_result)
-                        clipboard_text = clipboard_result
-                except Exception:
-                    logging.exception('Pre-translation plugin failed: %s', plugin_filename)
-
-        if current_text is None:
-            return None, clipboard_text, translation_plugins, post_translation_plugins
-
-        self.log_pipeline('pre_translation.complete', output=current_text, clipboard_output=clipboard_text, translation_plugins=[getattr(p, 'name', type(p).__name__) for p in translation_plugins], post_plugins=[getattr(p, 'name', type(p).__name__) for p in post_translation_plugins])
-        return current_text, clipboard_text, translation_plugins, post_translation_plugins
 
     def is_translation_worthy_output(self, text):
         return self._get_plugin_pipeline().translation_worthy(text)
-        stripped = text.strip() if isinstance(text, str) else text
-        if not stripped:
-            return False
-        if isinstance(stripped, str) and (
-            stripped.startswith('[Console]') or
-            stripped.startswith('[Hook ') or
-            stripped.startswith('[Hook #')
-        ):
-            return False
-        return True
 
     def prepare_plugin_output_bundle(self, text, allow_auto_copy=False):
         """Run every stateful pre-translation plugin in lossless arrival order."""
         return self._get_plugin_pipeline().prepare(text, allow_auto_copy)
-        with self.output_processing_lock:
-            current_text, clipboard_pre_translation, translation_plugins, post_translation_plugins = self.run_pre_translation_plugins(text)
-        if current_text is None:
-            self.log_pipeline('bundle.dropped_pre_translation', incoming=text, clipboard_pre_translation=clipboard_pre_translation)
-            return None
-
-        internal_marker_stripped = False
-        if isinstance(current_text, str):
-            internal_match = re.match(r'^\[Hook #?\d+\|\d+\]\s*(.*)$', current_text.strip(), re.DOTALL)
-            if internal_match:
-                current_text = internal_match.group(1) + ('\n' if current_text.endswith('\n') else '')
-                internal_marker_stripped = True
-        if isinstance(clipboard_pre_translation, str):
-            clipboard_match = re.match(r'^\[Hook #?\d+\|\d+\]\s*(.*)$', clipboard_pre_translation.strip(), re.DOTALL)
-            if clipboard_match:
-                clipboard_pre_translation = clipboard_match.group(1) + ('\n' if clipboard_pre_translation.endswith('\n') else '')
-
-        translator_input = current_text.strip() if isinstance(current_text, str) else current_text
-        clipboard_text = clipboard_pre_translation.strip() if isinstance(clipboard_pre_translation, str) else clipboard_pre_translation
-        translation_candidates = []
-        if not internal_marker_stripped and self.is_translation_worthy_output(translator_input):
-            for plugin in translation_plugins:
-                should_translate = getattr(plugin, 'should_translate_text', None)
-                try:
-                    if callable(should_translate) and not should_translate(translator_input):
-                        continue
-                except Exception:
-                    logging.exception('Translation eligibility check failed: %s', getattr(plugin, 'name', type(plugin).__name__))
-                translation_candidates.append(plugin)
-        incoming_is_hook_preview = isinstance(text, str) and text.lstrip().startswith('[Hook')
-        output_is_hook_preview = isinstance(current_text, str) and current_text.lstrip().startswith('[Hook')
-        effective_auto_copy = allow_auto_copy or (
-            incoming_is_hook_preview and
-            not output_is_hook_preview and
-            not internal_marker_stripped
-        )
-        prepared = {
-            'incoming': text,
-            'current_text': current_text,
-            'translator_input': translator_input,
-            'clipboard_text': clipboard_text,
-            'translation_plugins': tuple(translation_candidates),
-            'post_translation_plugins': tuple(post_translation_plugins),
-            'allow_auto_copy': effective_auto_copy,
-        }
-        self.log_pipeline('bundle.prepared', incoming=text, translator_input=translator_input, clipboard_text=clipboard_text, allow_auto_copy=effective_auto_copy, translation_plugin_count=len(translation_candidates), post_plugin_count=len(post_translation_plugins))
-        return prepared
 
     def prepared_output_requires_translation(self, prepared):
         return self._get_plugin_pipeline().requires_translation(prepared)
-        return bool(prepared['translation_plugins'])
 
     def complete_plugin_output_bundle(self, prepared):
         """Translate only the newest prepared logical line and run later plugins."""
         return self._get_plugin_pipeline().complete(prepared)
-        current_text = prepared['current_text']
-        translator_input = prepared['translator_input']
-        clipboard_text = prepared['clipboard_text']
-        translation_plugins = prepared['translation_plugins']
-        post_translation_plugins = prepared['post_translation_plugins']
-        display_text = current_text
-
-        if translation_plugins:
-            translation_results = []
-            self.log_pipeline('translation.request', translator_input=translator_input, display_source=current_text, clipboard_source=clipboard_text, translation_plugins=[getattr(p, 'name', type(p).__name__) for p in translation_plugins])
-            for plugin in translation_plugins:
-                try:
-                    translated = plugin.translate_text(translator_input)
-                    if translated:
-                        translation_results.append((plugin.name, translated.strip()))
-                        self.log_pipeline('translation.result', plugin=plugin.name, translated=translated.strip())
-                    else:
-                        self.log_pipeline('translation.empty', plugin=plugin.name, translator_input=translator_input)
-                except Exception:
-                    logging.exception('Translation plugin failed: %s', getattr(plugin, 'name', type(plugin).__name__))
-
-            if len(translation_results) == 1:
-                display_text = f"{current_text.rstrip()}\n{translation_results[0][1]}\n\n"
-            elif translation_results:
-                formatted_translations = "\n".join(
-                    f"[{plugin_name}] {translated_text}"
-                    for plugin_name, translated_text in translation_results
-                )
-                display_text = f"{current_text.rstrip()}\n{formatted_translations}\n\n"
-            self.log_pipeline('bundle.translation_phase_complete', display_text=display_text, clipboard_text=clipboard_text)
-
-        for plugin in post_translation_plugins:
-            try:
-                result = plugin.process_text(display_text)
-                if result is None:
-                    self.log_pipeline('post_translation.plugin_dropped', plugin=getattr(plugin, 'name', type(plugin).__name__), incoming=display_text)
-                    return None, None
-                self.log_pipeline('post_translation.plugin_result', plugin=getattr(plugin, 'name', type(plugin).__name__), output=result)
-                display_text = result
-            except Exception:
-                logging.exception('Post-translation plugin failed: %s', getattr(plugin, 'name', type(plugin).__name__))
-
-        self.log_pipeline('output.summary', translator_input=translator_input, output_window_text=display_text, clipboard_text=clipboard_text)
-        return display_text, clipboard_text
 
     def remember_translation_context(self, prepared):
         return self._get_plugin_pipeline().remember_context(prepared)
-        translator_input = prepared['translator_input']
-        for plugin in prepared['translation_plugins']:
-            try:
-                remember_line = getattr(plugin, 'remember_original_line', None)
-                if callable(remember_line) and translator_input:
-                    remember_line(translator_input)
-            except Exception:
-                logging.exception('Failed to remember translation context for %s', getattr(plugin, 'name', type(plugin).__name__))
 
     def deliver_plugin_output_bundle(self, completed, prepared):
         self.remember_translation_context(prepared)
@@ -1588,444 +1175,9 @@ class SugoiHookGUI:
             on_saved=lambda: (self.update_hook_status_panel(), self.update_hook_action_state()),
         ).open(plugin_filename, self.plugins[plugin_filename])
 
-    def _configure_selected_plugin_legacy(self):
-        """Open configuration dialog for selected plugin with scrollable content"""
-        selection = self.plugins_tree.selection()
-        if not selection:
-            return
-
-        item = self.plugins_tree.item(selection[0])
-        plugin_name = item['values'][1]
-
-        plugin_filename = None
-        for filename, plugin in self.plugins.items():
-            if plugin.name == plugin_name:
-                plugin_filename = filename
-                break
-
-        if not plugin_filename:
-            return
-
-        plugin = self.plugins[plugin_filename]
-        dynamic_settings_fn = getattr(plugin, 'get_settings_for_values', None)
-        draft_values = {}
-
-        def get_dialog_settings():
-            if callable(dynamic_settings_fn):
-                return dynamic_settings_fn(draft_values)
-            return plugin.get_settings()
-
-        settings = get_dialog_settings()
-
-        if not settings:
-            self.notify_user(f"Plugin '{plugin_name}' has no configurable settings.", level='info')
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title(f"Configure {plugin_name}")
-        dialog.geometry("800x900")
-        dialog.configure(bg=self.colors['bg'])
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.rowconfigure(0, weight=1)
-        dialog.columnconfigure(0, weight=1)
-
-        container = ttk.Frame(dialog, style="TFrame")
-        container.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
-        container.rowconfigure(1, weight=1)
-        container.columnconfigure(0, weight=1)
-
-        title_card = ttk.Frame(container, style="Card.TFrame", padding=15)
-        title_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(
-            title_card,
-            text=f"⚙️ {plugin_name} Settings",
-            font=('Segoe UI', 14, 'bold'),
-            foreground=self.colors['primary']
-        ).pack()
-
-        settings_card = ttk.Frame(container, style="Card.TFrame", padding=15)
-        settings_card.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
-        settings_card.rowconfigure(0, weight=1)
-        settings_card.columnconfigure(0, weight=1)
-
-        canvas = tk.Canvas(settings_card, bg=self.colors['surface'], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(settings_card, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas, style="Card.TFrame")
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw", width=canvas.winfo_width())
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        def configure_canvas_width(event):
-            canvas.itemconfig(canvas_window, width=event.width)
-        canvas.bind('<Configure>', configure_canvas_width)
-
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-
-        def widget_is_descendant(child, ancestor):
-            current = child
-            while current is not None:
-                if current == ancestor:
-                    return True
-                try:
-                    parent_name = current.winfo_parent()
-                except Exception:
-                    return False
-                if not parent_name:
-                    return False
-                try:
-                    current = current._nametowidget(parent_name)
-                except Exception:
-                    return False
-            return False
-
-        def on_mousewheel(event):
-            try:
-                hovered = dialog.winfo_containing(event.x_root, event.y_root)
-            except Exception:
-                hovered = event.widget
-
-            if hovered is None or not widget_is_descendant(hovered, canvas):
-                return
-
-            try:
-                hovered_class = hovered.winfo_class().lower()
-            except Exception:
-                hovered_class = ''
-
-            if hovered_class in {'tcombobox', 'combobox', 'listbox', 'text', 'entry', 'spinbox'}:
-                return
-
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            return "break"
-        canvas.bind_all("<MouseWheel>", on_mousewheel)
-
-        setting_widgets = {}
-        overlay_preview = {'card': None, 'frame': None, 'translation': None, 'original': None, 'warning': None}
-
-        def resolve_setting_value(var, options, value_type):
-            if value_type in ('choice', 'color') and options:
-                display_value = var.get()
-                if value_type == 'color' and ' - ' in display_value:
-                    return display_value.split(' - ')[0]
-                for key, display in options.items():
-                    if display == display_value or key == display_value:
-                        return key
-                return display_value
-            if value_type == 'multiline_str':
-                return var.get('1.0', tk.END).rstrip('\n')
-            return var.get()
-
-        def safe_preview_font(font_name, size, bold=False, italic=False):
-            styles = []
-            if bold:
-                styles.append('bold')
-            if italic:
-                styles.append('italic')
-            return (font_name, size, ' '.join(styles)) if styles else (font_name, size)
-
-        def refresh_overlay_preview(*_args):
-            if plugin_filename != 'overlay_window.py' or not overlay_preview['frame']:
-                return
-            try:
-                values = {
-                    name: resolve_setting_value(var, options, value_type)
-                    for name, (var, options, value_type) in setting_widgets.items()
-                }
-                bg_color = values.get('bg_color', '#1e1e2e')
-                border_color = values.get('border_color', self.colors['border'])
-                overlay_preview['frame'].configure(
-                    bg=bg_color,
-                    highlightbackground=border_color,
-                    highlightcolor=border_color
-                )
-                overlay_preview['translation'].configure(
-                    bg=bg_color,
-                    fg=values.get('translation_color', '#89b4fa'),
-                    font=safe_preview_font(
-                        values.get('translation_font', 'Segoe UI'),
-                        int(values.get('translation_font_size', 14)),
-                        bold=bool(values.get('translation_bold', True))
-                    )
-                )
-                overlay_preview['original'].configure(
-                    bg=bg_color,
-                    fg=values.get('original_color', '#a6adc8'),
-                    font=safe_preview_font(
-                        values.get('original_font', 'Segoe UI'),
-                        int(values.get('original_font_size', 10))
-                    )
-                )
-                overlay_preview['warning'].configure(
-                    bg=bg_color,
-                    fg=values.get('warning_color', '#f9e2af'),
-                    font=safe_preview_font(
-                        values.get('warning_font', 'Segoe UI'),
-                        int(values.get('warning_font_size', 12)),
-                        italic=bool(values.get('warning_italic', True))
-                    )
-                )
-            except Exception:
-                pass
-
-        def collect_current_draft_values():
-            for setting_name, (var, options, value_type) in setting_widgets.items():
-                draft_values[setting_name] = resolve_setting_value(var, options, value_type)
-
-        def render_settings_form():
-            nonlocal setting_widgets
-            collect_current_draft_values()
-            setting_widgets = {}
-
-            for child in scrollable_frame.winfo_children():
-                child.destroy()
-
-            current_settings = get_dialog_settings()
-
-            for setting_name, setting_info in current_settings.items():
-                current_value, value_type, description, *options = setting_info
-                options = options[0] if options else None
-
-                if setting_name in draft_values:
-                    current_value = draft_values[setting_name]
-
-                setting_frame = ttk.Frame(scrollable_frame)
-                setting_frame.pack(fill=tk.X, pady=8, padx=5)
-
-                ttk.Label(
-                    setting_frame,
-                    text=description + ":",
-                    font=('Segoe UI', 10, 'bold'),
-                    foreground=self.colors['fg']
-                ).pack(anchor=tk.W, pady=(0, 5))
-
-                if value_type == 'color' and options:
-                    color_frame = ttk.Frame(setting_frame)
-                    color_frame.pack(fill=tk.X)
-                    var = tk.StringVar(value=current_value)
-                    combo = ttk.Combobox(color_frame, textvariable=var, width=35)
-                    combo['values'] = [f"{key} - {value}" for key, value in options.items()]
-                    if current_value in options:
-                        combo.set(f"{current_value} - {options[current_value]}")
-                    combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-
-                    preview_canvas = tk.Canvas(
-                        color_frame,
-                        width=40,
-                        height=25,
-                        bg=current_value,
-                        highlightthickness=1,
-                        highlightbackground=self.colors['border']
-                    )
-                    preview_canvas.pack(side=tk.LEFT)
-
-                    def update_preview(event=None, combo=combo, preview_canvas=preview_canvas):
-                        selected = combo.get()
-                        if ' - ' in selected:
-                            color_code = selected.split(' - ')[0]
-                            try:
-                                preview_canvas.config(bg=color_code)
-                            except Exception:
-                                pass
-                        refresh_overlay_preview()
-
-                    combo.bind('<<ComboboxSelected>>', update_preview)
-                    combo.bind('<KeyRelease>', update_preview)
-                    setting_widgets[setting_name] = (var, options, value_type)
-
-                elif value_type == 'int_slider' and options:
-                    slider_frame = ttk.Frame(setting_frame)
-                    slider_frame.pack(fill=tk.X)
-                    var = tk.IntVar(value=current_value)
-                    value_label = ttk.Label(
-                        slider_frame,
-                        text=str(current_value),
-                        font=('Segoe UI', 10, 'bold'),
-                        foreground=self.colors['primary']
-                    )
-                    value_label.pack(side=tk.RIGHT, padx=(10, 0))
-                    slider = tk.Scale(
-                        slider_frame,
-                        from_=options['min'],
-                        to=options['max'],
-                        orient=tk.HORIZONTAL,
-                        variable=var,
-                        bg=self.colors['surface'],
-                        fg=self.colors['fg'],
-                        highlightthickness=0,
-                        troughcolor=self.colors['surface_light'],
-                        activebackground=self.colors['primary'],
-                        command=lambda v, label=value_label: label.config(text=str(int(float(v))))
-                    )
-                    slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                    var.trace_add('write', refresh_overlay_preview)
-                    setting_widgets[setting_name] = (var, options, value_type)
-
-                elif value_type == 'choice' and options:
-                    var = tk.StringVar(value=current_value)
-                    combo = ttk.Combobox(setting_frame, textvariable=var)
-                    combo['values'] = [options.get(key, key) for key in options.keys()]
-                    if current_value in options:
-                        combo.set(options[current_value])
-                    combo.pack(fill=tk.X)
-
-                    def on_choice_change(event=None, setting_name=setting_name, var=var, options=options, value_type=value_type):
-                        draft_values[setting_name] = resolve_setting_value(var, options, value_type)
-                        refresh_overlay_preview()
-                        if setting_name == 'provider' and callable(dynamic_settings_fn):
-                            render_settings_form()
-
-                    combo.bind('<<ComboboxSelected>>', on_choice_change)
-                    combo.bind('<KeyRelease>', refresh_overlay_preview)
-                    setting_widgets[setting_name] = (var, options, value_type)
-
-                elif value_type == 'bool':
-                    var = tk.BooleanVar(value=current_value)
-                    check = ttk.Checkbutton(setting_frame, text="Enabled", variable=var)
-                    check.pack(anchor=tk.W)
-                    var.trace_add('write', refresh_overlay_preview)
-                    setting_widgets[setting_name] = (var, None, value_type)
-
-                elif value_type == 'int':
-                    var = tk.IntVar(value=current_value)
-                    entry = ttk.Entry(setting_frame, textvariable=var)
-                    entry.pack(fill=tk.X)
-                    var.trace_add('write', refresh_overlay_preview)
-                    setting_widgets[setting_name] = (var, None, value_type)
-
-                elif value_type == 'secret':
-                    var = tk.StringVar(value=current_value)
-                    entry = ttk.Entry(setting_frame, textvariable=var, show='*')
-                    entry.pack(fill=tk.X)
-                    setting_widgets[setting_name] = (var, None, value_type)
-
-                elif value_type == 'multiline_str':
-                    text_frame = ttk.Frame(setting_frame)
-                    text_frame.pack(fill=tk.BOTH, expand=True)
-                    text_frame.columnconfigure(0, weight=1)
-                    text_frame.rowconfigure(0, weight=1)
-                    text_widget = tk.Text(
-                        text_frame,
-                        height=10,
-                        wrap=tk.WORD,
-                        bg=self.colors['surface'],
-                        fg=self.colors['fg'],
-                        insertbackground=self.colors['fg'],
-                        relief=tk.FLAT,
-                        borderwidth=1
-                    )
-                    text_scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
-                    text_widget.configure(yscrollcommand=text_scrollbar.set)
-                    text_widget.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-                    text_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-                    if current_value:
-                        text_widget.insert('1.0', current_value)
-                    setting_widgets[setting_name] = (text_widget, None, value_type)
-
-                else:
-                    var = tk.StringVar(value=current_value)
-                    entry = ttk.Entry(setting_frame, textvariable=var)
-                    entry.pack(fill=tk.X)
-                    setting_widgets[setting_name] = (var, None, value_type)
-
-            refresh_overlay_preview()
-
-        render_settings_form()
-
-        if plugin_filename == 'overlay_window.py':
-            preview_card = ttk.Frame(container, style="Card.TFrame", padding=15)
-            preview_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-            ttk.Label(
-                preview_card,
-                text="Live Preview",
-                font=('Segoe UI', 11, 'bold'),
-                foreground=self.colors['primary']
-            ).pack(anchor=tk.W, pady=(0, 8))
-            preview_frame = tk.Frame(
-                preview_card,
-                bg='#1e1e2e',
-                highlightthickness=1,
-                highlightbackground=self.colors['border'],
-                padx=14,
-                pady=12
-            )
-            preview_frame.pack(fill=tk.X)
-            translation_label = tk.Label(preview_frame, text='Girl: "Do I look a little tired?"', anchor='w', justify='left')
-            translation_label.pack(fill=tk.X)
-            original_label = tk.Label(preview_frame, text='少女「少し疲れた感じ、出てるかな」', anchor='w', justify='left', pady=4)
-            original_label.pack(fill=tk.X)
-            warning_label = tk.Label(preview_frame, text='Please enable the translation plugin', anchor='w', justify='left')
-            warning_label.pack(fill=tk.X, pady=(6, 0))
-            overlay_preview.update({
-                'card': preview_card,
-                'frame': preview_frame,
-                'translation': translation_label,
-                'original': original_label,
-                'warning': warning_label,
-            })
-            refresh_overlay_preview()
-
-        btn_card = ttk.Frame(container, style="Card.TFrame", padding=15)
-        btn_card.grid(row=3, column=0, sticky="ew")
-
-        def save_settings():
-            collect_current_draft_values()
-            saved, accepted_values = self.save_plugin_settings_transactionally(
-                plugin_filename, plugin, draft_values
-            )
-            if not saved:
-                return
-            self.update_hook_status_panel()
-            self.update_hook_action_state()
-            canvas.unbind_all("<MouseWheel>")
-            rejected_count = len(draft_values) - len(accepted_values)
-            if rejected_count:
-                self.notify_user(f"Saved accepted settings for {plugin_name}; {rejected_count} invalid setting(s) were not saved.", level='warning')
-            else:
-                self.notify_user(f"Saved settings for {plugin_name}.", level='success')
-            dialog.destroy()
-
-        def cancel():
-            canvas.unbind_all("<MouseWheel>")
-            dialog.destroy()
-
-        btn_container = ttk.Frame(btn_card)
-        btn_container.pack(expand=True)
-        ttk.Button(btn_container, text="💾 Save Settings", command=save_settings, style="TButton").pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(btn_container, text="✖️ Cancel", command=cancel, style="Disclosure.TButton").pack(side=tk.LEFT)
-
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
-        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
-        dialog.geometry(f"+{x}+{y}")
-        dialog.protocol("WM_DELETE_WINDOW", cancel)
-
     def apply_plugin_settings(self, plugin_filename, plugin, draft_values):
         """Apply plugin settings and retain only values the plugin accepted."""
         return self._sync_plugin_manager_context().apply_settings(plugin_filename, plugin, draft_values)
-        accepted_values = {}
-        with self.output_processing_lock:
-            for setting_name, value in draft_values.items():
-                try:
-                    if plugin.set_setting(setting_name, value):
-                        accepted_values[setting_name] = value
-                    else:
-                        logging.warning("Plugin %s rejected setting %s", plugin_filename, setting_name)
-                except Exception:
-                    logging.exception("Plugin %s failed to apply setting %s", plugin_filename, setting_name)
-            persisted_values = self.plugin_settings.setdefault(plugin_filename, {})
-            for setting_name in draft_values:
-                persisted_values.pop(setting_name, None)
-            persisted_values.update(accepted_values)
-            if not persisted_values:
-                self.plugin_settings.pop(plugin_filename, None)
-        return accepted_values
 
     def save_plugin_settings_transactionally(self, plugin_filename, plugin, draft_values, require_all=False):
         """Apply settings and roll runtime state back if persistence fails."""
@@ -2035,34 +1187,6 @@ class SugoiHookGUI:
         if require_all and not saved:
             self.notify_user("One or more plugin settings were rejected; no changes were saved.", level='warning')
         return saved, accepted
-        previous_persisted_exists = plugin_filename in self.plugin_settings
-        previous_persisted = copy.deepcopy(self.plugin_settings.get(plugin_filename, {}))
-        current_settings = plugin.get_settings()
-        previous_runtime = {
-            setting_name: setting_spec[0]
-            for setting_name, setting_spec in current_settings.items()
-            if setting_name in draft_values and setting_spec
-        }
-
-        accepted_values = self.apply_plugin_settings(plugin_filename, plugin, draft_values)
-        should_rollback = require_all and len(accepted_values) != len(draft_values)
-        if not should_rollback and self.save_plugins_config():
-            return True, accepted_values
-
-        with self.output_processing_lock:
-            for setting_name, old_value in previous_runtime.items():
-                if setting_name in accepted_values:
-                    try:
-                        plugin.set_setting(setting_name, old_value)
-                    except Exception:
-                        logging.exception("Plugin %s failed to roll back setting %s", plugin_filename, setting_name)
-            if previous_persisted_exists:
-                self.plugin_settings[plugin_filename] = previous_persisted
-            else:
-                self.plugin_settings.pop(plugin_filename, None)
-        if should_rollback:
-            self.notify_user("One or more plugin settings were rejected; no changes were saved.", level='warning')
-        return False, accepted_values
 
     def commit_game_profiles(self, updated_profiles):
         """Persist a complete profile snapshot, retaining old state on failure."""
@@ -2071,12 +1195,6 @@ class SugoiHookGUI:
         saved = store.commit(updated_profiles)
         self.game_profiles = store.profiles
         return saved
-        previous_profiles = self.game_profiles
-        self.game_profiles = updated_profiles
-        if self.save_game_profiles():
-            return True
-        self.game_profiles = previous_profiles
-        return False
 
     # ==================== END PLUGIN SYSTEM METHODS =============    
     # ==================== GAME PROFILES SYSTEM METHODS =============    
@@ -2086,59 +1204,21 @@ class SugoiHookGUI:
             return self._get_game_profile_store().identity_for_path(psutil.Process(pid).exe())
         except Exception:
             return None, None, None
-        try:
-            proc = psutil.Process(pid)
-            exe_path = proc.exe()
-            exe_size = Path(exe_path).stat().st_size
-            
-            # Generate unique ID from path and size
-            unique_string = f"{exe_path}_{exe_size}"
-            game_id = hashlib.md5(unique_string.encode()).hexdigest()
-            
-            return game_id, exe_path, exe_size
-        except Exception:
-            return None, None, None
-    
+
     def load_game_profiles(self):
         """Load game profiles from JSON file"""
         store = self._get_game_profile_store()
         store.path = self.game_profiles_path
         self.game_profiles = store.load()
         return self.game_profiles
-        self.game_profiles = {}
-        if not self.game_profiles_path:
-            return
-        try:
-            profiles, recovered_from_backup = load_json_object(
-                self.game_profiles_path, is_valid_game_profiles
-            )
-        except JsonPersistenceError as error:
-            self.report_config_issue(self.game_profiles_path, error)
-            return
-        if profiles is None:
-            return
-        if recovered_from_backup:
-            self.report_config_issue(
-                self.game_profiles_path,
-                "the primary file was invalid; recovered the last valid saved profiles",
-            )
-        self.game_profiles = profiles
-    
+
     def save_game_profiles(self):
         """Save game profiles to JSON file"""
         store = self._get_game_profile_store()
         store.path = self.game_profiles_path
         store.profiles = self.game_profiles
         return store.save()
-        if not self.game_profiles_path:
-            return False
-        try:
-            save_json_object_atomic(self.game_profiles_path, self.game_profiles, is_valid_game_profiles)
-            return True
-        except JsonPersistenceError as error:
-            self.report_config_issue(self.game_profiles_path, error)
-            return False
-    
+
     def save_hook_profile(self, hook_id=None, hook_code=None):
         """Save current hook selection to game profile"""
         if not self.current_game_id or not self.attached_pid:
@@ -2530,266 +1610,6 @@ class SugoiHookGUI:
             messagebox.showerror("Error", f"Failed to launch game:\n{error}")
             return False
 
-    def _open_profile_manager_legacy(self):
-        """Open game profile management window"""
-        # Load profiles
-        self.load_game_profiles()
-        
-        # Create profile manager window
-        manager = tk.Toplevel(self.root)
-        manager.title("💾 Manage Game Profiles")
-        manager.geometry("1500x550")
-        manager.minsize(1500, 550)
-        manager.configure(bg=self.colors['bg'])
-        manager.transient(self.root)
-        manager.grab_set()
-        
-        # Main container
-        container = ttk.Frame(manager, style="TFrame")
-        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(1, weight=1)
-        
-        # Title section
-        title_frame = ttk.Frame(container, style="Card.TFrame", padding=15)
-        title_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
-        title_frame.columnconfigure(0, weight=1)
-        
-        ttk.Label(title_frame, text="💾 Saved Game Profiles", 
-                 font=('Segoe UI', 16, 'bold'),
-                 foreground=self.colors['primary']).pack()
-        
-        ttk.Label(title_frame, text=f"Total profiles: {len(self.game_profiles)}",
-                 font=('Segoe UI', 10),
-                 foreground=self.colors['text_dim']).pack(pady=(5, 0))
-        
-        # Profile list card
-        list_card = ttk.Frame(container, style="Card.TFrame", padding=15)
-        list_card.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 15))
-        list_card.columnconfigure(0, weight=1)
-        list_card.rowconfigure(0, weight=1)
-        
-        # Create treeview with better column layout
-        columns = ('game', 'engine', 'hook_type', 'hook_info', 'last_used')
-        profiles_tree = ttk.Treeview(list_card, columns=columns, show='headings', height=12)
-        
-        # Configure headings
-        profiles_tree.heading('game', text='Game')
-        profiles_tree.heading('engine', text='Engine')
-        profiles_tree.heading('hook_type', text='Type')
-        profiles_tree.heading('hook_info', text='Hook Info')
-        profiles_tree.heading('last_used', text='Last Used')
-        
-        # Configure columns with center alignment
-        profiles_tree.column('game', width=180, anchor='center')
-        profiles_tree.column('engine', width=80, anchor='center')
-        profiles_tree.column('hook_type', width=80, anchor='center')
-        profiles_tree.column('hook_info', width=280, anchor='center')
-        profiles_tree.column('last_used', width=140, anchor='center')
-        
-        scrollbar = ttk.Scrollbar(list_card, orient=tk.VERTICAL, command=profiles_tree.yview)
-        profiles_tree.configure(yscrollcommand=scrollbar.set)
-        
-        profiles_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        
-        # Populate profiles
-        for game_id, profile in self.game_profiles.items():
-            engine_name = "🌙 Luna"
-            hook_type = "🔧 Manual" if profile['hook_type'] == 'manual' else "🎯 Auto"
-            hook_info = profile.get('hook_data', 'Unknown')
-            if profile['hook_type'] == 'auto':
-                hook_function = profile.get('hook_function', 'Unknown')
-                hook_info = f"ID {hook_info} - {hook_function}"
-            
-            profiles_tree.insert('', tk.END, text=game_id, values=(
-                profile['exe_name'],
-                engine_name,
-                hook_type,
-                hook_info,
-                profile.get('last_used', 'Unknown')
-            ))
-        
-        # Buttons frame - centered
-        btn_card = ttk.Frame(container, style="Card.TFrame", padding=15)
-        btn_card.grid(row=2, column=0, sticky=(tk.W, tk.E))
-        
-        # Center the buttons
-        btn_container = ttk.Frame(btn_card)
-        btn_container.pack(expand=True)
-        
-        def delete_selected():
-            """Delete selected profile"""
-            selection = profiles_tree.selection()
-            if not selection:
-                messagebox.showwarning("No Selection", "Please select a profile to delete.")
-                return
-            
-            item = profiles_tree.item(selection[0])
-            game_id = profiles_tree.item(selection[0], 'text')
-            game_name = item['values'][0]
-            
-            result = messagebox.askyesno(
-                "Confirm Deletion",
-                f"Delete profile for '{game_name}'?"
-            )
-            
-            if result:
-                updated_profiles = dict(self.game_profiles)
-                del updated_profiles[game_id]
-                if not self.commit_game_profiles(updated_profiles):
-                    return
-                profiles_tree.delete(selection[0])
-                # Update title count
-                for widget in title_frame.winfo_children():
-                    if isinstance(widget, ttk.Label) and 'Total profiles' in str(widget.cget('text')):
-                        widget.config(text=f"Total profiles: {len(self.game_profiles)}")
-                self.notify_user("Profile deleted.", level='success')
-        
-        def launch_game():
-            """Launch the selected game and auto-attach"""
-            selection = profiles_tree.selection()
-            if not selection:
-                messagebox.showwarning("No Selection", "Please select a profile to launch.")
-                return
-            
-            item = profiles_tree.item(selection[0])
-            game_id = profiles_tree.item(selection[0], 'text')
-            game_name = item['values'][0]
-            
-            if game_id not in self.game_profiles:
-                return
-            
-            profile = self.game_profiles[game_id]
-            exe_path = profile.get('exe_path', '')
-            if not exe_path or not os.path.exists(exe_path):
-                messagebox.showerror("Error", 
-                    f"Game executable not found:\n{exe_path}\n\n"
-                    "The game may have been moved or uninstalled.")
-                return
-            
-            try:
-                # Set silent auto-launch flag to suppress hook messages
-                self.silent_auto_launch = True
-                
-                # Close the profile manager window
-                manager.destroy()
-                
-                # Launch the game
-                self.launch_executable(exe_path)
-                
-                # Show notification in output
-                self.append_event(f"🚀 Launching game: {game_name}\n")
-                self.append_event("⏳ Waiting for process to start and auto-hook...\n\n")
-                self.append_event("⏳ Wait around 3-5 seconds after the game is launched then you should see further updates...\n\n")
-                
-                # Start a thread to monitor and auto-attach
-                def monitor_and_attach():
-                    # Wait a bit for the game to start
-                    time.sleep(3)
-                    
-                    # Try to find the process (try for up to 30 seconds)
-                    max_attempts = 30
-                    for attempt in range(max_attempts):
-                        try:
-                            # Look for process by executable path
-                            for proc in psutil.process_iter(['pid', 'exe']):
-                                try:
-                                    proc_exe = proc.info.get('exe', '')
-                                    if proc_exe and os.path.normpath(proc_exe.lower()) == os.path.normpath(exe_path.lower()):
-                                        # Found the process
-                                        pid = proc.info['pid']
-                                        
-                                        # Update UI in main thread
-                                        def attach_to_game():
-                                            # Existing sessions are replaced safely by attach_process
-                                            
-                                            # Refresh process list to include the new game
-                                            self.refresh_processes()
-                                            
-                                            # Find and select the process in the tree
-                                            for tree_item in self.process_tree.get_children():
-                                                tree_values = self.process_tree.item(tree_item)['values']
-                                                if tree_values[0] == pid:
-                                                    self.process_tree.selection_set(tree_item)
-                                                    self.process_tree.see(tree_item)
-                                                    break
-                                            
-                                            # Wait a bit to ensure the UI is updated and selection is properly set
-                                            # This prevents "No Selection" errors
-                                            def perform_attach():
-                                                self.attach_process()
-                                                self.append_event(f"✓ Game launched and attached successfully!\n")
-                                                self.append_event(f"⏳ Please start the game and click on a dialogue or two and wait a bit...\n\n")
-                                                self.append_event(f"⏳ Game hook will automatically be applied after that...\n\n")
-
-                                            # Delay attachment by 4 second to ensure UI is ready
-                                            self.root.after(4000, perform_attach)
-                                        
-                                        self.run_on_ui_thread(attach_to_game)
-                                        return
-                                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                                    continue
-                        except Exception:
-                            pass
-                        
-                        # Wait before next attempt
-                        time.sleep(1)
-                    
-                    # If we get here, process was not found
-                    self.append_event(
-                        "⚠️ Could not find game process after 30 seconds.\n"
-                        "   Please attach manually if the game is running.\n\n"
-                    )
-                
-                threading.Thread(target=monitor_and_attach, daemon=True).start()
-                
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to launch game:\n{str(e)}")
-        
-        def clear_all():
-            """Clear all profiles"""
-            if not self.game_profiles:
-                messagebox.showinfo("Info", "No profiles to clear.")
-                return
-            
-            result = messagebox.askyesno(
-                "Confirm Clear All",
-                f"Delete all {len(self.game_profiles)} profiles?\n\nThis cannot be undone."
-            )
-            
-            if result:
-                if not self.commit_game_profiles({}):
-                    return
-                profiles_tree.delete(*profiles_tree.get_children())
-                # Update title count
-                for widget in title_frame.winfo_children():
-                    if isinstance(widget, ttk.Label) and 'Total profiles' in str(widget.cget('text')):
-                        widget.config(text=f"Total profiles: 0")
-                self.notify_user("All profiles cleared.", level='success')
-        
-        ttk.Button(btn_container, text="🚀 Launch Game", 
-                  command=launch_game,
-                  style="TButton").pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(btn_container, text="🗑️ Delete Selected", 
-                  command=delete_selected,
-                  style="Secondary.TButton").pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(btn_container, text="🗑️ Clear All", 
-                  command=clear_all,
-                  style="Danger.TButton").pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(btn_container, text="✖️ Close", 
-                  command=manager.destroy,
-                  style="Secondary.TButton").pack(side=tk.LEFT, padx=5)
-        
-        # Center the window
-        manager.update_idletasks()
-        x = (manager.winfo_screenwidth() // 2) - (manager.winfo_width() // 2)
-        y = (manager.winfo_screenheight() // 2) - (manager.winfo_height() // 2)
-        manager.geometry(f"+{x}+{y}")
-    
     # ==================== END GAME PROFILES SYSTEM METHODS =============    
     def setup_modern_theme(self):
         """Create a modern custom theme"""
@@ -3000,99 +1820,6 @@ class SugoiHookGUI:
         self.update_scrollbar_visibility = widgets.update_scrollbar_visibility
         self.configure_mousewheel_routing(self.canvas_shell)
 
-    def _setup_ui_legacy(self):
-        """Create the modern GUI layout with a fixed header and scrollable content area."""
-        header_frame = ttk.Frame(self.root, style="TFrame", padding=(15, 15, 15, 0))
-        header_frame.pack(fill=tk.X)
-
-        canvas_shell = ttk.Frame(self.root, style="TFrame")
-        canvas_shell.pack(fill=tk.BOTH, expand=True, padx=15, pady=(10, 0))
-
-        canvas = tk.Canvas(canvas_shell, bg=self.colors['bg'], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(canvas_shell, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        main_container = ttk.Frame(canvas, style="TFrame", padding=(15, 15, 15, 0))
-        canvas_window = canvas.create_window((0, 0), window=main_container, anchor="nw")
-
-        self.canvas = canvas
-        self.scrollbar = scrollbar
-        self.canvas_shell = canvas_shell
-        self.scrollbar_visible = True
-
-        def configure_scroll_region(event=None):
-            bbox = canvas.bbox("all")
-            if not bbox:
-                canvas.configure(scrollregion=(0, 0, 0, 0))
-                if self.scrollbar_visible:
-                    scrollbar.pack_forget()
-                    self.scrollbar_visible = False
-                return
-
-            x1, y1, x2, y2 = bbox
-            content_height = max(0, y2 - y1)
-            viewport_height = max(1, canvas.winfo_height())
-            canvas.configure(scrollregion=(x1, y1, x2, y2))
-
-            needs_scrollbar = content_height > viewport_height + 1
-            if needs_scrollbar and not self.scrollbar_visible:
-                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-                self.scrollbar_visible = True
-            elif not needs_scrollbar:
-                if self.scrollbar_visible:
-                    scrollbar.pack_forget()
-                    self.scrollbar_visible = False
-                canvas.yview_moveto(0)
-
-        def configure_canvas_width(event):
-            canvas.itemconfigure(canvas_window, width=event.width)
-            configure_scroll_region()
-
-        main_container.bind("<Configure>", configure_scroll_region)
-        canvas.bind("<Configure>", configure_canvas_width)
-        self.update_scrollbar_visibility = configure_scroll_region
-        self.bind_vertical_mousewheel(canvas)
-        
-        # Header
-        
-        title_label = ttk.Label(header_frame, text="🐾Sugoi Hook v0.6x", 
-                               font=('Segoe UI', 18, 'bold'),
-                               foreground=self.colors['primary'])
-        title_label.pack(side=tk.LEFT)
-        
-        self.engine_var = tk.StringVar(value=self.current_engine)
-        
-        # Content area with a responsive selection row
-        content_frame = ttk.Frame(main_container)
-        content_frame.pack(fill=tk.BOTH, expand=True)
-        content_frame.columnconfigure(0, weight=1)
-        content_frame.rowconfigure(0, weight=0)  # Process + Hook selection area
-        content_frame.rowconfigure(1, weight=0)  # Plugins card
-        content_frame.rowconfigure(2, weight=1)  # Output card
-
-        self.selection_cards_frame = ttk.Frame(content_frame)
-        self.selection_cards_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 12))
-        self.selection_cards_frame.columnconfigure(0, weight=1)
-        self.selection_cards_frame.columnconfigure(1, weight=1)
-        
-        # === PROCESS SELECTION CARD ===
-        self.create_process_card(self.selection_cards_frame)
-        
-        # === HOOK SELECTION CARD ===
-        self.create_hook_card(self.selection_cards_frame)
-        self.update_selection_cards_layout()
-        
-        # === PLUGINS CARD ===
-        self.create_plugins_card(content_frame)
-        
-        # === TEXT OUTPUT CARD ===
-        self.create_output_card(content_frame)
-        
-
-        self.configure_mousewheel_routing(main_container)
-        
     def bind_vertical_mousewheel(self, widget):
         """Bind mouse wheel scrolling to a specific widget only."""
         widget.bind("<MouseWheel>", lambda event, target=widget: self.on_mousewheel_scroll(event, target))
@@ -3737,34 +2464,7 @@ class SugoiHookGUI:
         Returns True if process should be excluded
         """
         return self._get_process_service().should_exclude(proc_name, proc_path)
-        name_lower = proc_name.lower()
-        
-        # 1. Check exact executable name matches
-        if name_lower in self.excluded_executables:
-            return True
-        
-        # 2. Check if it's in a system directory
-        if proc_path:
-            path_lower = proc_path.lower()
-            for sys_dir in self.system_dirs:
-                if path_lower.startswith(sys_dir):
-                    return True
-        
-        # 3. Check system process patterns
-        for pattern in self.system_process_patterns:
-            if pattern in name_lower:
-                return True
-        
-        # 4. Check bloatware patterns
-        for pattern in self.bloatware_patterns:
-            if pattern in name_lower:
-                return True
-        
-        # 5. Filter processes without window titles (likely background services)
-        # This will be checked in refresh_processes
-        
-        return False
-    
+
     def has_visible_window(self, pid):
         """Check if process has a visible window (heuristic for user applications)"""
         try:
@@ -3845,21 +2545,7 @@ class SugoiHookGUI:
     def get_process_architecture(self, pid):
         """Determine if a process is 32-bit or 64-bit"""
         return windows_process_architecture(pid)
-        try:
-            if sys.platform == 'win32':
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                handle = kernel32.OpenProcess(0x1000, False, pid)
-                if handle:
-                    is_wow64 = ctypes.c_bool()
-                    if kernel32.IsWow64Process(handle, ctypes.byref(is_wow64)):
-                        kernel32.CloseHandle(handle)
-                        return "x86" if is_wow64.value else "x64"
-                    kernel32.CloseHandle(handle)
-        except Exception:
-            logging.exception('Failed to set main window icon')
-        return "x86"
-    
+
     def refresh_processes(self):
         """Refresh the list of running processes with advanced filtering"""
         self.process_tree.delete(*self.process_tree.get_children())
@@ -3869,38 +2555,7 @@ class SugoiHookGUI:
             icon = self.get_process_icon(process_info.pid)
             self.all_processes.append((process_info.pid, process_info.architecture, process_info.name, icon))
         self.filter_processes()
-        return
-        self.process_tree.delete(*self.process_tree.get_children())
-        self.all_processes = []
-        self.process_icons.clear()
-        
-        for proc in psutil.process_iter(['pid', 'name', 'exe']):
-            try:
-                pid = proc.info['pid']
-                name = proc.info['name']
-                exe_path = proc.info.get('exe', '')
-                
-                # Skip very low PIDs (system processes)
-                if pid < 100:
-                    continue
-                
-                # Apply advanced filtering
-                if self.should_exclude_process(name, exe_path):
-                    continue
-                
-                # Additional heuristic: check if process has visible windows
-                # This helps filter out background services and daemons
-                if not self.has_visible_window(pid):
-                    continue
-                
-                arch = self.get_process_architecture(pid)
-                icon = self.get_process_icon(pid)
-                self.all_processes.append((pid, arch, name, icon))
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-        
-        self.filter_processes()
-    
+
     def filter_processes(self):
         """Filter processes based on search term"""
         self.process_tree.delete(*self.process_tree.get_children())
@@ -4094,107 +2749,6 @@ class SugoiHookGUI:
         """Open the extracted hook-code help view."""
         show_hook_help_dialog(self.root, self.colors)
 
-    def _show_hook_help_legacy(self):
-        """Show help dialog for hook code syntax"""
-        help_text = """
-HOOK CODE SYNTAX GUIDE
-
-═══════════════════════════════════════════════════════
-
-H-CODES (Hook Codes)
-Format: H{type}{flags}{data_offset}[*deref_offset][:split_offset]@address[:module[:function]]
-
-TYPE CHARACTERS:
-  A - ANSI text, big endian, single character
-  B - ANSI text, single character
-  W - Unicode text, single character
-  H - Unicode text with hex dump, single character
-  S - ANSI string
-  Q - Unicode string
-  V - UTF-8 string
-  M - Unicode string with hex dump
-
-FLAGS:
-  F - Full string capture
-  N - No context
-  <number>< - Null length specifier
-  <number># - Codepage specifier
-  <hex>+ - Padding bytes
-
-EXAMPLES:
-  HB4@0                    Hook at address 0, ANSI single char, offset 4
-  HS-4@12345               Hook at 0x12345, ANSI string, offset -4
-  HQ@401000:user32.dll     Hook in user32.dll at offset 0x401000, Unicode string
-  HSN-4*0@12345            Hook with no context, ANSI string, offset -4
-
-═══════════════════════════════════════════════════════
-
-R-CODES (Read Codes)
-Format: R{type}[null_length<][codepage#]@address
-
-TYPE CHARACTERS:
-  S - ANSI string
-  Q - Unicode string
-  V - UTF-8 string
-  M - Unicode string with hex dump
-
-EXAMPLES:
-  RS@401000               Read ANSI string at address 0x401000
-  RQ@401000               Read Unicode string at address 0x401000
-  RV@402000               Read UTF-8 string at address 0x402000
-
-═══════════════════════════════════════════════════════
-
-TIPS:
-• Use hex addresses (e.g., 0x401000 or just 401000)
-• Negative offsets are allowed (e.g., -4)
-• Module names are optional but helpful for portability
-• Start with simple hooks (HB4@0) and adjust as needed
-• Monitor the output to see if the hook captures text correctly
-
-For more information, refer to the Luna Hook documentation and current community hook guides.
-"""
-        
-        # Create a custom dialog
-        help_window = tk.Toplevel(self.root)
-        help_window.title("Hook Code Syntax Help")
-        help_window.geometry("700x600")
-        help_window.configure(bg=self.colors['bg'])
-        
-        # Make it modal
-        help_window.transient(self.root)
-        help_window.grab_set()
-        
-        # Create text widget with scrollbar
-        text_frame = ttk.Frame(help_window, style="Card.TFrame", padding=15)
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
-        
-        text_widget = scrolledtext.ScrolledText(
-            text_frame,
-            wrap=tk.WORD,
-            bg=self.colors['surface'],
-            fg=self.colors['fg'],
-            font=('Consolas', 9),
-            borderwidth=0,
-            padx=10,
-            pady=10
-        )
-        text_widget.pack(fill=tk.BOTH, expand=True)
-        text_widget.insert(1.0, help_text)
-        text_widget.config(state='disabled')
-        
-        # Close button
-        close_btn = ttk.Button(help_window, text="Close", 
-                              command=help_window.destroy,
-                              style="Secondary.TButton")
-        close_btn.pack(pady=(0, 15))
-        
-        # Center the window
-        help_window.update_idletasks()
-        x = (help_window.winfo_screenwidth() // 2) - (help_window.winfo_width() // 2)
-        y = (help_window.winfo_screenheight() // 2) - (help_window.winfo_height() // 2)
-        help_window.geometry(f"+{x}+{y}")
-    
     def on_engine_change(self):
         """Luna-only build; engine selection is fixed."""
         self.engine_var.set("luna")
