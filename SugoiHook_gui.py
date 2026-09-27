@@ -21,6 +21,7 @@ import types
 import copy
 from pathlib import Path
 
+from config_validation import is_valid_game_profiles, is_valid_plugins_config
 from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
 from luna_session import LunaProcessSession
 from luna_controller import LunaController, LunaHookTextEvent
@@ -41,24 +42,6 @@ ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
 EARLY_LOG_STREAM = None
 EARLY_LOG_PATH = None
-def is_valid_plugins_config(config):
-    return (
-        isinstance(config.get('active_plugins', []), list)
-        and all(isinstance(name, str) for name in config.get('active_plugins', []))
-        and isinstance(config.get('plugin_order', []), list)
-        and all(isinstance(name, str) for name in config.get('plugin_order', []))
-        and isinstance(config.get('plugin_settings', {}), dict)
-        and all(isinstance(name, str) and isinstance(settings, dict)
-                for name, settings in config.get('plugin_settings', {}).items())
-        and (config.get('window_geometry') is None or isinstance(config.get('window_geometry'), str))
-        and (config.get('compact_window_geometry') is None or isinstance(config.get('compact_window_geometry'), str))
-    )
-
-
-def is_valid_game_profiles(config):
-    return all(isinstance(game_id, str) and isinstance(profile, dict) for game_id, profile in config.items())
-
-
 def get_runtime_launcher_path() -> Path:
     """Compatibility delegate for legacy callers and early bootstrap."""
     return resolve_runtime_context(module_path=__file__).launcher_path

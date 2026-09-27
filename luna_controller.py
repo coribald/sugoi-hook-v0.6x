@@ -116,9 +116,15 @@ class LunaController:
         try:
             session.send(f"attach -P{target_pid}")
         except Exception:
-            with self._lock:
-                if self._session is session:
-                    self._session = None
+            session.request_stop()
+            try:
+                session.terminate()
+            except Exception:
+                self.logger.exception("Failed to terminate Luna session after attach command failure")
+            finally:
+                with self._lock:
+                    if self._session is session:
+                        self._session = None
             raise
         if start_workers:
             self.start_workers(session)

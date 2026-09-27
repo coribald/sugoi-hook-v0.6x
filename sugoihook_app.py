@@ -1,21 +1,85 @@
 """Application coordinator composition root."""
 
-import importlib
+import copy
+import ctypes
+import hashlib
+import importlib.util
+import logging
+import os
+import re
+import subprocess
 import sys
+import threading
+import time
+import types
+from pathlib import Path
+
+import psutil
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+from PIL import Image, ImageDraw, ImageTk
+import win32con
+import win32gui
+import win32process
+import win32ui
+
+from config_validation import is_valid_game_profiles, is_valid_plugins_config
+from game_profile_store import GameProfileStore
+from hook_help_dialog import show_hook_help as show_hook_help_dialog
+from hook_registry import HookRegistry
+from json_persistence import JsonPersistenceError, load_json_object, save_json_object_atomic
+from luna_controller import LunaController, LunaHookTextEvent
+from luna_session import LunaProcessSession
+from main_window import MainWindowView
+from output_pipeline import OutputPipeline
+from plugin_manager import DYNAMIC_PLUGIN_PACKAGE, PluginManager
+from plugin_pipeline import PluginPipeline
+from plugin_settings_dialog import PluginSettingsDialog
+from process_service import ProcessService, windows_process_architecture
+from profile_manager_dialog import ProfileManagerDialog
+from runtime_context import resolve_runtime_context
+from ui_dispatcher import UIThreadDispatcher
+
+try:
+    import pystray
+    from pystray import MenuItem as item
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+
+try:
+    from plugins import HookPlugin
+    PLUGINS_AVAILABLE = True
+except ImportError:
+    HookPlugin = None
+    PLUGINS_AVAILABLE = False
+
+CREATE_NO_WINDOW = 0x08000000
+DEFAULT_DPI = 96.0
+MIN_SYSTEM_PID = 100
+ICON_SIZE = 32
+SCALED_ICON_SIZE = 24
+ICON_CORNER_RADIUS = 3
+MAX_HOOK_TEXTS = 3
+MAX_PREVIEW_LENGTH = 80
+AUTO_HOOK_INITIAL_DELAY = 8000
+AUTO_HOOK_RETRY_DELAY = 5000
+AUTO_HOOK_MAX_RETRIES = 3
+PROCESS_MONITOR_DELAY = 3000
+GAME_LAUNCH_ATTACH_DELAY = 4000
 
 
-# When the compatibility launcher is executed as a script it is ``__main__``;
-# importing it again under its file name would create a circular second module.
-_bootstrap = sys.modules.get('SugoiHook_gui')
-if _bootstrap is None:
-    candidate = sys.modules.get('__main__')
-    if candidate and hasattr(candidate, 'runtime_debug_logging_enabled'):
-        _bootstrap = candidate
-if _bootstrap is None:
-    _bootstrap = importlib.import_module('SugoiHook_gui')
-for _name, _value in vars(_bootstrap).items():
-    if not _name.startswith('__'):
-        globals().setdefault(_name, _value)
+def runtime_debug_logging_enabled() -> bool:
+    env_enabled = os.environ.get('SUGOIHOOK_DEBUG_LOGGING', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    argv_enabled = any(str(arg).strip().lower() == '--debug' for arg in sys.argv[1:])
+    executable_name = Path(sys.executable).name.lower()
+    argv0_name = Path(sys.argv[0]).name.lower() if sys.argv else ''
+    debug_build_enabled = any(
+        name.endswith('_debug.exe') or name.endswith('debug.exe')
+        for name in (executable_name, argv0_name)
+        if name
+    )
+    return env_enabled or argv_enabled or debug_build_enabled
 
 class SugoiHookGUI:
     def __init__(self, root):

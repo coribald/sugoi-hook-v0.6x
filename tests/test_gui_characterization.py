@@ -8,6 +8,7 @@ move into dedicated modules.
 from hashlib import md5
 from io import StringIO
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -29,6 +30,19 @@ gui.sys.stderr = gui.ORIGINAL_STDERR
 class CompatibilityEntrypointTests(unittest.TestCase):
     def test_gui_module_reexports_application_coordinator(self):
         self.assertIs(gui.SugoiHookGUI, sugoihook_app.SugoiHookGUI)
+
+    def test_application_coordinator_imports_without_bootstrap_module(self):
+        project_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [sys.executable, "-c", "import sugoihook_app; print(sugoihook_app.SugoiHookGUI.__name__)"],
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "SugoiHookGUI")
 
 
 class RecordingRoot:

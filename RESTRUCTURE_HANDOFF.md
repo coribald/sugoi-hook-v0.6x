@@ -152,22 +152,24 @@ Commit: `afcdc74 Finalize application composition root`
 - Moved the `SugoiHookGUI` class into `sugoihook_app.py`.
 - Reduced `SugoiHook_gui.py` to bootstrap imports/constants/logging, a
   compatibility export, and `main()`.
-- Preserved early source/packaged logging: `sugoihook_app.py` reuses the
-  already-loaded bootstrap module instead of importing a second copy.
-- Added a compatibility regression test asserting
-  `SugoiHook_gui.SugoiHookGUI is sugoihook_app.SugoiHookGUI`.
+- Preserved early source/packaged logging while making module ownership one-way:
+  `SugoiHook_gui.py` imports the coordinator, and `sugoihook_app.py` now imports
+  its dependencies explicitly without importing or copying bootstrap globals.
+- Added compatibility regression tests asserting both direct coordinator import
+  and `SugoiHook_gui.SugoiHookGUI is sugoihook_app.SugoiHookGUI`.
 - Updated README file structure for the newly extracted modules.
 
 An initial circular import appeared only when the launcher was run as a script
-(`__main__`). It was fixed by resolving the already-loaded bootstrap module;
-the final source-launch smoke test reached “SugoiHookGUI constructed” and the
-Tk main loop successfully.
+(`__main__`). The temporary bootstrap-global bridge was subsequently removed;
+the application coordinator is now directly importable in either order, while
+the compatibility launcher still reached “SugoiHookGUI constructed” and the Tk
+main loop successfully in the source-launch smoke test.
 
 ## Validation status
 
 Latest automated validation on `afcdc74`:
 
-- `python -m unittest discover -s tests -v`: **72 tests passed**.
+- `python -m unittest discover -s tests -v`: **74 tests passed**.
 - Explicit top-level-module plus `plugins`, `deep_translator`, and `tests`
   compilation passed. (Do not use literal `*.py` with PowerShell;
   `compileall` reports it as a non-expandable path.)

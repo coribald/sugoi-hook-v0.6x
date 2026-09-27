@@ -88,6 +88,18 @@ class LunaProcessSessionTests(unittest.TestCase):
         self.assertTrue(process.killed)
         self.assertEqual(return_code, -9)
 
+    def test_attach_command_failure_terminates_spawned_process(self):
+        process = FakeProcess()
+        process.stdin.write = lambda _value: (_ for _ in ()).throw(OSError("broken pipe"))
+        controller = self.make_controller(process_factory=lambda *args, **kwargs: process)
+
+        with self.assertRaises(OSError):
+            controller.start(["luna"], 42, "game.exe")
+
+        self.assertIsNone(controller.session)
+        self.assertTrue(process.terminated or process.killed)
+        self.assertIsNotNone(process.poll())
+
     def test_stale_session_cannot_receive_commands(self):
         controller = self.make_controller()
         current = controller.start(["luna"], 42, "current.exe")
